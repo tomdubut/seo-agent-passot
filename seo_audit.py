@@ -14,6 +14,7 @@ Run `python seo_audit.py --help` for all options.
 """
 
 import argparse
+import json
 import re
 import sys
 import time
@@ -89,6 +90,9 @@ class Page:
     word_count: int = None
     char_count: int = None
     http_last_modified: str = ""
+    structured_data_types: list = field(default_factory=list)
+    og_tags: dict = field(default_factory=dict)
+    twitter_card: bool = False
 
     @property
     def ok(self):
@@ -249,6 +253,38 @@ def extract_head_fields(soup):
     return title, meta_description, canonical, hreflang, h1_list, h2_list
 
 
+def extract_structured_data(soup):
+    """Presence-only check: JSON-LD @type values, Open Graph tags, Twitter Card.
+    Does not validate schema correctness, just whether it's there at all."""
+    ld_types = []
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string or "")
+        except (ValueError, TypeError):
+            continue
+        for item in data if isinstance(data, list) else [data]:
+            if not isinstance(item, dict):
+                continue
+            for node in item.get("@graph", [item]):
+                if not isinstance(node, dict):
+                    continue
+                t = node.get("@type")
+                if isinstance(t, list):
+                    ld_types.extend(str(x) for x in t)
+                elif t:
+                    ld_types.append(str(t))
+
+    og_tags = {}
+    for meta in soup.find_all("meta", property=re.compile("^og:", re.I)):
+        content = (meta.get("content") or "").strip()
+        if content:
+            og_tags[meta["property"].lower()] = content
+
+    twitter_card = bool(soup.find("meta", attrs={"name": re.compile("^twitter:card$", re.I)}))
+
+    return sorted(set(ld_types)), og_tags, twitter_card
+
+
 def extract_content_metrics(soup, lang):
     container = find_main_container(soup)
     # Re-parse a copy so we can strip boilerplate without mutating `soup`
@@ -291,6 +327,7 @@ def build_page(session, url, lang, sitemap_lastmod, timeout, base_netloc):
     page.all_internal_links = resolve_links(soup.find_all("a", href=True), url, base_netloc)
     (page.title, page.meta_description, page.canonical, page.hreflang,
      page.h1_list, page.h2_list) = extract_head_fields(soup)
+    (page.structured_data_types, page.og_tags, page.twitter_card) = extract_structured_data(soup)
     (page.word_count, page.char_count, page.image_total,
      page.missing_alt_examples, main_link_tags) = extract_content_metrics(soup, lang)
     page.image_missing_alt = len(page.missing_alt_examples)
@@ -370,13 +407,37 @@ def check_broken_links(session, pages, timeout, delay, skip=False):
     return results, link_sources
 
 
+def compute_inbound_link_counts(pages):
+    """How many other crawled pages link to each page from their main content
+    (nav/footer links excluded, since those are identical on every page and
+    would mask genuinely under-linked content)."""
+    urls_by_key = {p.url.rstrip("/"): p.url for p in pages}
+    inbound = defaultdict(set)
+    for p in pages:
+        if not p.ok:
+            continue
+        for link in p.internal_links:
+            key = link.rstrip("/")
+            target = urls_by_key.get(key)
+            if target and target != p.url:
+                inbound[target].add(p.url)
+    return inbound
+
+
 # --------------------------------------------------------------------------
 # Issue generation
 # --------------------------------------------------------------------------
 
+# Homepages are expected to have few/no inbound links from other pages'
+# main content (they're reached via nav, not content links) — exclude them
+# from the "weakly linked" check to avoid noise.
+WEAK_INBOUND_THRESHOLD = 1
+
 def generate_issues(pages, pairs, unmatched_en, unmatched_ja, broken_links, link_sources,
-                     dup_titles, dup_meta, thin_words, thin_chars):
+                     dup_titles, dup_meta, thin_words, thin_chars, en_prefix=DEFAULT_EN_PREFIX):
     issues = []
+    inbound_counts = compute_inbound_link_counts(pages)
+    homepage_paths = {"/", en_prefix.rstrip("/") or "/en"}
 
     def add(sev, cat, url, lang, detail):
         issues.append(Issue(sev, cat, url, lang, detail))
@@ -417,6 +478,22 @@ def generate_issues(pages, pairs, unmatched_en, unmatched_ja, broken_links, link
         unit = "words" if p.lang == "en" else "characters"
         if content_len is not None and content_len < threshold:
             add(MEDIUM, "Thin Content", p.url, p.lang, f"{content_len} {unit} of main content (threshold {threshold})")
+
+        if not p.structured_data_types:
+            add(LOW, "Missing Structured Data", p.url, p.lang, "No JSON-LD structured data (schema.org) found on this page")
+
+        missing_og = [k for k in ("og:title", "og:description", "og:image") if k not in p.og_tags]
+        if missing_og:
+            add(LOW, "Missing Open Graph Tags", p.url, p.lang,
+                f"Missing: {', '.join(missing_og)} (affects link preview appearance on social/chat apps)")
+
+        path = urlparse(p.url).path.rstrip("/") or "/"
+        if path not in homepage_paths:
+            inbound = len(inbound_counts.get(p.url, set()))
+            if inbound <= WEAK_INBOUND_THRESHOLD:
+                add(LOW, "Weakly Linked Internally", p.url, p.lang,
+                    f"Only {inbound} other page(s) link to this page from their main content — "
+                    "consider adding internal links from related pages")
 
     for (lang, _text), urls in dup_titles.items():
         add(MEDIUM, "Duplicate Title", urls[0], lang, f"Same title used on {len(urls)} pages: {truncate_join(urls)}")
@@ -500,6 +577,9 @@ CATEGORY_GUIDANCE = {
     "Missing Hreflang Cross-Link": ("Add reciprocal hreflang tags linking the EN and JP versions.", "Medium"),
     "EN/JP Inconsistency": ("Review and align content between the EN and JP versions of the page.", "Medium"),
     "No Language Counterpart": ("Confirm this is intentional (e.g. JP-only blog content); translate if not.", "Strategic"),
+    "Missing Structured Data": ("Add JSON-LD schema.org markup (Article, FAQPage, Organization, etc. as relevant).", "Involved"),
+    "Missing Open Graph Tags": ("Add og:title, og:description and og:image meta tags for social/chat link previews.", "Quick"),
+    "Weakly Linked Internally": ("Add internal links to this page from related content elsewhere on the site.", "Quick"),
 }
 
 
@@ -631,6 +711,25 @@ def write_executive_summary(wb, pages, issues, pairs, unmatched_en, unmatched_ja
             state["row"] += 1
         state["row"] += 1
 
+    content_gaps = unmatched_en + unmatched_ja
+    if content_gaps:
+        subheader("Translation / content parity gaps (not in the Issues tab's severity ranking)")
+        line(f"{len(unmatched_ja)} JP page(s) have no English version. {len(unmatched_en)} EN page(s) have no Japanese version.")
+        line("Not necessarily wrong (e.g. intentionally JP-only blog posts) — but a deliberate content decision, not a bug to fix.")
+        table_header(["URL", "Language", "Content Length"])
+        for p in sorted(content_gaps, key=lambda x: (x.lang, x.url)):
+            if p.lang == "en" and p.word_count is not None:
+                length = f"{p.word_count} words"
+            elif p.char_count is not None:
+                length = f"{p.char_count} characters"
+            else:
+                length = ""
+            ws.cell(row=state["row"], column=1, value=p.url)
+            ws.cell(row=state["row"], column=2, value=p.lang)
+            ws.cell(row=state["row"], column=3, value=length)
+            state["row"] += 1
+        state["row"] += 1
+
     subheader("Fix-first priority list")
     high_cats = sorted(c for c, s in counts_by_cat.items() if HIGH in s)
     med_cats = sorted(c for c, s in counts_by_cat.items() if MEDIUM in s and HIGH not in s)
@@ -645,6 +744,11 @@ def write_executive_summary(wb, pages, issues, pairs, unmatched_en, unmatched_ja
         )
     if med_cats:
         priorities.append("Schedule Medium severity issues next: " + ", ".join(med_cats) + ".")
+    if content_gaps:
+        priorities.append(
+            f"Decide on the {len(content_gaps)} page(s) with no counterpart in the other language — "
+            "translate for parity, or confirm it's intentional (see the table above)."
+        )
     if not priorities:
         priorities.append("No High or Medium severity issues found. Review Low/Info items opportunistically.")
     for idx, text in enumerate(priorities, 1):
@@ -726,13 +830,33 @@ def build_workbook(pages, issues, pairs, unmatched_en, unmatched_ja, broken_link
                 rows, col_widths=[45, 6, 10, 10, 10, 60])
 
     # Internal Links (per page)
+    inbound_counts = compute_inbound_link_counts(pages)
     rows = []
     for p in sorted(pages, key=lambda x: (x.lang, x.url)):
         if not p.ok:
             continue
-        rows.append([p.url, p.lang, p.internal_link_count])
-    write_sheet(wb, "Internal Links", ["URL", "Language", "Internal Link Count (main content)"],
-                rows, col_widths=[45, 6, 30])
+        rows.append([p.url, p.lang, p.internal_link_count, len(inbound_counts.get(p.url, set()))])
+    write_sheet(wb, "Internal Links",
+                ["URL", "Language", "Outbound Links (main content)", "Inbound Links (from other pages' main content)"],
+                rows, col_widths=[45, 6, 22, 30])
+
+    # Structured Data & Social Tags
+    rows = []
+    for p in sorted(pages, key=lambda x: (x.lang, x.url)):
+        if not p.ok:
+            continue
+        rows.append([
+            p.url, p.lang, truncate_join(p.structured_data_types, 5) or "(none)",
+            "Yes" if p.og_tags else "No",
+            "Yes" if "og:title" in p.og_tags else "No",
+            "Yes" if "og:description" in p.og_tags else "No",
+            "Yes" if "og:image" in p.og_tags else "No",
+            "Yes" if p.twitter_card else "No",
+        ])
+    write_sheet(wb, "Structured Data & Social", [
+        "URL", "Language", "JSON-LD Types Found", "Has Open Graph Tags?",
+        "OG Title?", "OG Description?", "OG Image?", "Twitter Card?",
+    ], rows, col_widths=[45, 6, 35, 16, 10, 14, 10, 12])
 
     # Broken Links
     rows = []
@@ -873,7 +997,7 @@ def main(argv=None):
 
     print("Generating issue list ...")
     issues = generate_issues(pages, pairs, unmatched_en, unmatched_ja, broken_links, link_sources,
-                              dup_titles, dup_meta, args.thin_words, args.thin_chars)
+                              dup_titles, dup_meta, args.thin_words, args.thin_chars, args.en_prefix)
 
     print("Writing workbook ...")
     wb = build_workbook(pages, issues, pairs, unmatched_en, unmatched_ja, broken_links, link_sources,

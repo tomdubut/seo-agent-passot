@@ -45,25 +45,33 @@ requests from your IP.
 ## What it checks
 
 - **Per page:** title tag, meta description, canonical tag, H1/H2
-  structure, image alt-text coverage, internal link count (within main
-  content), word count (EN) / character count (JP), last-modified date
-  (from the HTTP header if present, else the sitemap).
+  structure, image alt-text coverage, internal link count in and out
+  (within main content), word count (EN) / character count (JP),
+  last-modified date (from the HTTP header if present, else the sitemap),
+  JSON-LD structured data types present, Open Graph / Twitter Card tags.
 - **Site-wide:** missing/duplicate meta descriptions, missing/duplicate
   titles, missing/multiple H1s, missing alt text, thin content, broken
   internal links, missing/mismatched canonical tags, sitemap URLs that
-  redirect.
+  redirect, missing structured data, missing Open Graph tags, pages with
+  very few internal links pointing to them ("weakly linked").
 - **EN/JP comparison:** pages are paired via `hreflang` tags first, falling
   back to URL pattern matching (`/en/x/` ↔ `/x/`). For each pair: reciprocal
   hreflang presence, meta description present on only one side, byte-identical
   (likely untranslated) titles/meta descriptions, and H1 count mismatches.
   Pages with no counterpart in the other language are listed separately
-  (not necessarily wrong — e.g. a JP-only blog post — but worth a look).
+  (not necessarily wrong — e.g. a JP-only blog post — but worth a look) and
+  called out as a dedicated "translation / content parity gap" section in
+  the Executive Summary, not just buried as Info-severity rows.
 
 ## Output
 
-`passot_seo_audit.xlsx` with one tab per check type, plus an **Issues
-Summary** tab at the front — every flagged issue in one place, sorted by
-severity (High/Medium/Low/Info) and color-coded.
+`passot_seo_audit.xlsx` with an **Executive Summary** tab first — site
+totals, issues grouped by category with a recommended action and effort
+tag, a table of images missing alt text on multiple pages (fix the shared
+component once instead of page by page), the translation/content-parity
+gap list, and an auto-generated fix-first priority list. Then an **Issues
+Summary** tab with every flagged issue individually, sorted by severity
+and color-coded. Then one tab per check type for the full underlying data.
 
 Severity guide:
 - **High** — page unreachable, missing title, missing canonical, broken
@@ -74,9 +82,23 @@ Severity guide:
   EN/JP content inconsistencies (untranslated fields, meta present on
   only one side).
 - **Low** — missing alt text, sitemap URL redirects, minor EN/JP
-  structural differences (e.g. H1 count).
+  structural differences (e.g. H1 count), missing structured data, missing
+  Open Graph tags, weakly-linked pages.
 - **Info** — a page has no counterpart in the other language (informational,
-  not necessarily a problem).
+  not necessarily a problem — see the Executive Summary's dedicated
+  translation-gap section instead of hunting for these rows).
+
+## What it can't tell you (and why)
+
+This audits pages that already exist. It intentionally does **not**
+attempt to identify content or pages you don't have yet (keyword gaps,
+"what are people searching for that you don't rank for") — that needs
+real search-demand data (Google Search Console query data or a keyword
+research tool), which isn't wired up here, and fabricating numbers that
+look like search volume would be worse than not having them. The
+translation-parity and weak-internal-linking checks above are as close as
+this tool gets to "opportunities," and both are derived only from data
+it already crawled — nothing invented.
 
 ## Known limitations
 
