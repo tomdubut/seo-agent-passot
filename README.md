@@ -85,8 +85,13 @@ page's title, meta description, headings, and main content to Claude and
 asks for a genuine qualitative judgment — keyword/topic fit, whether the
 title and meta description are compelling (not just present), whether the
 content substantively covers the topic, and concrete suggestions. Results
-land in their own **AI Content & Keyword Analysis** tab, color-coded
-Good/Needs Improvement/Poor, plus a short rollup in the Executive Summary.
+land in their own **AI Content & Keyword Analysis** tab, sorted worst-rated
+first and color-coded on a five-level scale (Critical → Poor → Needs
+Improvement → Good → Excellent), plus a short rollup in the Executive
+Summary. Assessments and suggestions are always written in English
+regardless of the page's language — only the identified keyword/topic
+stays in the page's own language, since that's what a real searcher would
+actually type.
 
 **Setup:**
 1. Requires an Anthropic API key (console.anthropic.com).

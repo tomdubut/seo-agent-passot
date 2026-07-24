@@ -681,7 +681,11 @@ CATEGORY_GUIDANCE = {
 # AI content & keyword analysis (opt-in via --ai-analysis)
 # --------------------------------------------------------------------------
 
-RATING_VALUES = Literal["Good", "Needs Improvement", "Poor"]
+# Five levels, worst to best, so severity is visible at a glance instead of
+# collapsing everything short of "Good" into one bucket. RATING_SEVERITY
+# below (most-urgent-first) drives sorting in the sheet.
+RATING_VALUES = Literal["Critical", "Poor", "Needs Improvement", "Good", "Excellent"]
+RATING_SEVERITY = {"Critical": 0, "Poor": 1, "Needs Improvement": 2, "Good": 3, "Excellent": 4}
 
 
 class PageAIAnalysis(BaseModel):
@@ -699,12 +703,20 @@ class PageAIAnalysis(BaseModel):
 
 AI_ANALYSIS_SYSTEM_PROMPT = (
     "You are an experienced SEO analyst reviewing a single web page's on-page optimization. "
-    "Give concise, specific, and actionable judgments grounded in what is actually on the page — "
-    "not generic SEO advice a template could produce. Judge keyword/topic fit, whether the title "
-    "and meta description are compelling and relevant (not just present), and whether the content "
-    "substantively covers the topic a searcher would expect, in the page's own language. Be honest: "
-    "most pages have room to improve, so reserve 'Good' for genuinely strong pages, and make every "
-    "suggestion concrete enough that someone could act on it without asking a follow-up question."
+    "The page may be in English or Japanese, but always write your assessments and suggestions "
+    "in English — the person reading this report reads English. The one exception is "
+    "'keyword_or_topic': keep that in the page's own language (e.g. a Japanese keyword phrase for "
+    "a Japanese page), since that's what a real searcher would actually type, and translating it "
+    "would defeat the point. Give concise, specific, and actionable judgments grounded in what is "
+    "actually on the page — not generic SEO advice a template could produce. Judge keyword/topic "
+    "fit, whether the title and meta description are compelling and relevant (not just present), "
+    "and whether the content substantively covers the topic a searcher would expect. Use the five "
+    "rating levels with real spread, not clustered in the middle: 'Excellent' (nothing meaningful "
+    "to improve), 'Good' (solid, only minor polish possible), 'Needs Improvement' (real gaps worth "
+    "fixing but not urgent), 'Poor' (significant problems actively hurting this page's SEO), "
+    "'Critical' (severely deficient or missing — fix immediately). Be honest: most pages have room "
+    "to improve, so reserve 'Excellent' for genuinely strong pages, and make every suggestion "
+    "concrete enough that someone could act on it without asking a follow-up question."
 )
 
 
@@ -934,18 +946,20 @@ def write_executive_summary(wb, pages, issues, pairs, unmatched_en, unmatched_ja
     if ai_results:
         subheader("AI content & keyword review")
         rating_counts = defaultdict(int)
-        poor_pages = []
+        urgent_pages = []
         for url, r in ai_results.items():
             rating_counts[r.overall_rating] += 1
-            if r.overall_rating == "Poor":
-                poor_pages.append(url)
+            if r.overall_rating in ("Critical", "Poor"):
+                urgent_pages.append(url)
         line(
-            f"{len(ai_results)} page(s) reviewed. Good: {rating_counts.get('Good', 0)}, "
-            f"Needs Improvement: {rating_counts.get('Needs Improvement', 0)}, Poor: {rating_counts.get('Poor', 0)}."
+            f"{len(ai_results)} page(s) reviewed. "
+            + ", ".join(f"{lvl}: {rating_counts.get(lvl, 0)}" for lvl in RATING_SEVERITY)
+            + "."
         )
-        if poor_pages:
-            line("Pages rated 'Poor' overall: " + truncate_join(sorted(poor_pages), 8))
-        line("Full per-page assessments and suggestions are in the AI Content & Keyword Analysis tab.")
+        if urgent_pages:
+            line("Pages rated 'Poor' or 'Critical' overall: " + truncate_join(sorted(urgent_pages), 8))
+        line("Full per-page assessments and suggestions are in the AI Content & Keyword Analysis tab "
+             "(sorted worst-rated first).")
         state["row"] += 1
 
     subheader("Fix-first priority list")
@@ -968,9 +982,9 @@ def write_executive_summary(wb, pages, issues, pairs, unmatched_en, unmatched_ja
             "translate for parity, or confirm it's intentional (see the table above)."
         )
     if ai_results:
-        poor_count = sum(1 for r in ai_results.values() if r.overall_rating == "Poor")
-        if poor_count:
-            priorities.append(f"Review the {poor_count} page(s) the AI rated 'Poor' overall first.")
+        urgent_count = sum(1 for r in ai_results.values() if r.overall_rating in ("Critical", "Poor"))
+        if urgent_count:
+            priorities.append(f"Review the {urgent_count} page(s) the AI rated 'Poor' or 'Critical' overall first.")
     if not priorities:
         priorities.append("No High or Medium severity issues found. Review Low/Info items opportunistically.")
     for idx, text in enumerate(priorities, 1):
@@ -1143,9 +1157,11 @@ def build_workbook(pages, issues, pairs, unmatched_en, unmatched_ja, broken_link
 
 
 RATING_FILL = {
-    "Poor": PatternFill("solid", fgColor="FFC7CE"),
+    "Critical": PatternFill("solid", fgColor="FFC7CE"),
+    "Poor": PatternFill("solid", fgColor="FFD966"),
     "Needs Improvement": PatternFill("solid", fgColor="FFEB9C"),
     "Good": PatternFill("solid", fgColor="C6EFCE"),
+    "Excellent": PatternFill("solid", fgColor="A9D18E"),
 }
 
 
@@ -1159,7 +1175,11 @@ def write_ai_analysis_sheet(wb, pages, ai_results):
                       col_widths=[45, 6, 25, 10, 14, 45, 14, 45, 14, 45, 14, 60])
 
     rating_cols = {5: "title_rating", 7: "meta_description_rating", 9: "content_rating", 11: "overall_rating"}
-    for p in sorted(pages, key=lambda x: (x.lang, x.url)):
+    # Worst overall rating first, so the pages needing the most attention are
+    # right at the top instead of scattered alphabetically by URL.
+    sortable_pages = [p for p in pages if ai_results.get(p.url)]
+    sortable_pages.sort(key=lambda p: (RATING_SEVERITY.get(ai_results[p.url].overall_rating, 9), p.lang, p.url))
+    for p in sortable_pages:
         r = ai_results.get(p.url)
         if not r:
             continue
