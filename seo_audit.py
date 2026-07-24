@@ -225,12 +225,22 @@ def check_link_status(session, url, timeout):
         return f"ERROR: {e.__class__.__name__}"
 
 
+def find_main_container_labeled(soup):
+    """Among all candidate containers found on the page, pick the one with
+    the most text — not just the first matching selector. Themes/page
+    builders (Elementor especially) sometimes render a near-empty <main>
+    wrapper alongside the real content in a sibling container (e.g.
+    `.elementor`); picking the first match by priority alone can grab the
+    empty wrapper and report the page as having ~0 words."""
+    candidates = [(selector, el) for selector in MAIN_CONTENT_SELECTORS for el in soup.select(selector)]
+    if not candidates:
+        return "body-fallback (no selector matched)", (soup.body or soup)
+    return max(candidates, key=lambda pair: len(pair[1].get_text(strip=True)))
+
+
 def find_main_container(soup):
-    for selector in MAIN_CONTENT_SELECTORS:
-        el = soup.select_one(selector)
-        if el:
-            return el
-    return soup.body or soup
+    _, el = find_main_container_labeled(soup)
+    return el
 
 
 def extract_head_fields(soup):
@@ -1010,7 +1020,73 @@ def parse_args(argv=None):
     ap.add_argument("--skip-broken-links", action="store_true", help="Skip checking internal links for broken status")
     ap.add_argument("--exclude-sitemap", nargs="*", default=DEFAULT_SITEMAP_EXCLUDE,
                      help="Skip sub-sitemaps whose filename contains any of these substrings")
+    ap.add_argument("--debug-url", default=None,
+                     help="Fetch a single URL and print diagnostics about what content was extracted "
+                          "and why (use this to troubleshoot an unexpected word/char count) instead "
+                          "of running a full audit")
     return ap.parse_args(argv)
+
+
+def debug_single_url(session, url, en_prefix, timeout):
+    lang = classify_lang(url, en_prefix)
+    print(f"Fetching {url}  (classified as: {lang})\n")
+    resp, err = fetch_page(session, url, timeout)
+    if err or resp is None:
+        print(f"FETCH FAILED: {err}")
+        return 1
+
+    print(f"HTTP status: {resp.status_code}")
+    print(f"Content-Type: {resp.headers.get('Content-Type')}")
+    if resp.url != url:
+        print(f"Redirected to: {resp.url}")
+    if resp.status_code != 200 or "text/html" not in resp.headers.get("Content-Type", ""):
+        print("\nNot a 200 HTML response, so no content was extracted from it during a real audit run.")
+        return 1
+
+    soup = BeautifulSoup(resp.text, "lxml")
+    print(f"Raw HTML size: {len(resp.text)} characters\n")
+
+    print("Main-content selectors checked (in priority order), and what each finds on this page:")
+    for selector in MAIN_CONTENT_SELECTORS:
+        matches = soup.select(selector)
+        if matches:
+            lengths = [len(m.get_text(strip=True)) for m in matches]
+            print(f"  {selector!r:12} -> {len(matches)} match(es), text length(s): {lengths}")
+        else:
+            print(f"  {selector!r:12} -> no match")
+
+    chosen_selector, container = find_main_container_labeled(soup)
+    print(f"\n=> This audit run would use: {chosen_selector!r}")
+
+    word_count, char_count, image_total, missing_alt, _ = extract_content_metrics(soup, lang)
+    print(f"\nAfter stripping {BOILERPLATE_SELECTOR!r} from that container:")
+    print(f"  Word count (EN): {word_count}")
+    print(f"  Char count (JP): {char_count}")
+    print(f"  Images found: {image_total} (missing alt: {len(missing_alt)})")
+
+    working = BeautifulSoup(str(container), "lxml")
+    for tag in working.select(BOILERPLATE_SELECTOR):
+        tag.decompose()
+    preview = working.get_text(separator=" ", strip=True)[:400]
+    print(f"\nExtracted text preview (first 400 chars): {preview!r}")
+
+    full_body_len = len(soup.get_text(separator=" ", strip=True))
+    extracted_len = (word_count or 0) + (char_count or 0)
+    print(f"\nFor comparison, the ENTIRE page's text (not just the chosen container): {full_body_len} characters")
+    if full_body_len > 300 and extracted_len < 20:
+        print(
+            "\n>>> The page clearly has real text somewhere, but almost none of it came from the chosen\n"
+            "    container. That points to a container-selection bug (wrong element picked) rather than\n"
+            "    the page genuinely being empty. Share this output so it can be fixed."
+        )
+    elif full_body_len < 300:
+        print(
+            "\n>>> The whole page has very little real HTML text, even outside the chosen container.\n"
+            "    If the page visually looks content-rich, that content is likely delivered as images\n"
+            "    or JavaScript-rendered widgets rather than crawlable HTML text — worth checking\n"
+            "    view-source (not just the rendered page) in your browser to confirm."
+        )
+    return 0
 
 
 def main(argv=None):
@@ -1023,6 +1099,9 @@ def main(argv=None):
         "Accept-Language": "en,ja;q=0.9",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     })
+
+    if args.debug_url:
+        return debug_single_url(session, args.debug_url, args.en_prefix, args.timeout)
 
     print(f"Discovering pages from {args.sitemap_url} ...")
     try:
