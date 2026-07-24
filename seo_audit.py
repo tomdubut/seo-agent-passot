@@ -747,11 +747,22 @@ def analyze_page_with_ai(client, page, model, target_keyword=None):
 
     response = client.messages.parse(
         model=model,
-        max_tokens=1024,
+        max_tokens=2048,
+        # This is a single-page classification/rating task, not multi-step
+        # reasoning — thinking isn't needed, and Sonnet 5 runs it by default
+        # when the field is omitted, silently eating into max_tokens and
+        # risking the structured JSON output getting cut off mid-response.
+        thinking={"type": "disabled"},
         system=AI_ANALYSIS_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_content}],
         output_format=PageAIAnalysis,
     )
+    if response.parsed_output is None:
+        # Structured output didn't parse (e.g. truncated at max_tokens) —
+        # some SDK paths return None here instead of raising. Turn it into
+        # a real exception so the caller's try/except always catches it,
+        # rather than silently storing a None result that crashes later.
+        raise ValueError(f"Model returned no parseable output (stop_reason={response.stop_reason!r})")
     return response.parsed_output
 
 
@@ -919,6 +930,7 @@ def write_executive_summary(wb, pages, issues, pairs, unmatched_en, unmatched_ja
             state["row"] += 1
         state["row"] += 1
 
+    ai_results = {url: r for url, r in (ai_results or {}).items() if r is not None}
     if ai_results:
         subheader("AI content & keyword review")
         rating_counts = defaultdict(int)
