@@ -36,6 +36,7 @@ Useful flags (see `python seo_audit.py --help` for the full list):
 | `--output FILE.xlsx` | Change the output filename |
 | `--thin-words N` / `--thin-chars N` | Fallback thin-content thresholds for pages that don't match a known page type below (default: 300 words for EN, 600 characters for JP) |
 | `--delay SECONDS` | Seconds between requests (default 0.8s — increase if the site starts rate-limiting you) |
+| `--debug-url URL` | Fetch a single URL and print exactly which container was used for word/char count, and why — use this to troubleshoot an unexpected 0 or very low count instead of running a full audit |
 
 If the site blocks the crawler (403s), it's likely a WAF/bot-protection
 rule reacting to the request pattern or User-Agent — try `--delay 2` first,
@@ -135,8 +136,11 @@ it already crawled — nothing invented.
 - **No JS rendering** — pages are fetched as static HTML (`requests`, no
   headless browser). Elementor renders server-side so this is normally
   fine, but any content injected purely client-side won't be captured. If
-  a page's extracted word count looks suspiciously low, that's the tell to
-  check manually.
+  a page's extracted word/char count looks suspiciously low, run
+  `python seo_audit.py --debug-url "https://www.passot.co.jp/the/page/"`
+  to see exactly which container was used and why, and whether the real
+  text exists elsewhere in the raw HTML (a selection issue) or genuinely
+  isn't there as crawlable text (e.g. content delivered as images).
 - **No indexing/ranking/traffic data** — that requires Google Search
   Console, which isn't wired up here.
 - **No page speed / Core Web Vitals** — requires PageSpeed Insights API,
