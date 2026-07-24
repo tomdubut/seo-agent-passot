@@ -14,13 +14,16 @@ Run `python seo_audit.py --help` for all options.
 """
 
 import argparse
+import csv
 import json
+import os
 import re
 import sys
 import time
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from dataclasses import dataclass, field
+from typing import List, Literal
 from urllib.parse import urljoin, urlparse, urldefrag
 
 import requests
@@ -28,6 +31,7 @@ from bs4 import BeautifulSoup
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
+from pydantic import BaseModel
 
 # --------------------------------------------------------------------------
 # Config defaults (override via CLI flags — see --help)
@@ -41,6 +45,11 @@ DEFAULT_DELAY = 0.8
 DEFAULT_TIMEOUT = 15
 DEFAULT_THIN_WORDS_EN = 300
 DEFAULT_THIN_CHARS_JA = 600
+# Cap on stored main-content text per page — bounds memory and, when
+# --ai-analysis is used, bounds per-page token cost. Generous relative to
+# observed page sizes (even long-form articles run well under this).
+MAX_CONTENT_TEXT_CHARS = 8000
+DEFAULT_AI_MODEL = "claude-sonnet-5"
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 PassotSEOAudit/1.0"
@@ -93,6 +102,7 @@ class Page:
     structured_data_types: list = field(default_factory=list)
     og_tags: dict = field(default_factory=dict)
     twitter_card: bool = False
+    content_text: str = ""
 
     @property
     def ok(self):
@@ -314,7 +324,7 @@ def extract_content_metrics(soup, lang):
         char_count = len(re.sub(r"\s+", "", text))
 
     main_link_tags = working.find_all("a", href=True)
-    return word_count, char_count, len(images), missing_alt, main_link_tags
+    return word_count, char_count, len(images), missing_alt, main_link_tags, text[:MAX_CONTENT_TEXT_CHARS]
 
 
 def build_page(session, url, lang, sitemap_lastmod, timeout, base_netloc):
@@ -339,7 +349,7 @@ def build_page(session, url, lang, sitemap_lastmod, timeout, base_netloc):
      page.h1_list, page.h2_list) = extract_head_fields(soup)
     (page.structured_data_types, page.og_tags, page.twitter_card) = extract_structured_data(soup)
     (page.word_count, page.char_count, page.image_total,
-     page.missing_alt_examples, main_link_tags) = extract_content_metrics(soup, lang)
+     page.missing_alt_examples, main_link_tags, page.content_text) = extract_content_metrics(soup, lang)
     page.image_missing_alt = len(page.missing_alt_examples)
     page.internal_links = resolve_links(main_link_tags, url, base_netloc)
     page.internal_link_count = len(page.internal_links)
@@ -668,6 +678,101 @@ CATEGORY_GUIDANCE = {
 
 
 # --------------------------------------------------------------------------
+# AI content & keyword analysis (opt-in via --ai-analysis)
+# --------------------------------------------------------------------------
+
+RATING_VALUES = Literal["Good", "Needs Improvement", "Poor"]
+
+
+class PageAIAnalysis(BaseModel):
+    keyword_or_topic: str
+    keyword_is_inferred: bool
+    title_assessment: str
+    title_rating: RATING_VALUES
+    meta_description_assessment: str
+    meta_description_rating: RATING_VALUES
+    content_assessment: str
+    content_rating: RATING_VALUES
+    overall_rating: RATING_VALUES
+    suggestions: List[str]
+
+
+AI_ANALYSIS_SYSTEM_PROMPT = (
+    "You are an experienced SEO analyst reviewing a single web page's on-page optimization. "
+    "Give concise, specific, and actionable judgments grounded in what is actually on the page — "
+    "not generic SEO advice a template could produce. Judge keyword/topic fit, whether the title "
+    "and meta description are compelling and relevant (not just present), and whether the content "
+    "substantively covers the topic a searcher would expect, in the page's own language. Be honest: "
+    "most pages have room to improve, so reserve 'Good' for genuinely strong pages, and make every "
+    "suggestion concrete enough that someone could act on it without asking a follow-up question."
+)
+
+
+def load_keyword_map(path):
+    """CSV with 'url' and 'keyword' columns, mapping specific pages to a
+    site-owner-provided target keyword/topic instead of letting the AI infer
+    one from the page's own content."""
+    keyword_map = {}
+    with open(path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            url = (row.get("url") or row.get("URL") or "").strip()
+            keyword = (row.get("keyword") or row.get("Keyword") or "").strip()
+            if url and keyword:
+                keyword_map[url.rstrip("/")] = keyword
+    return keyword_map
+
+
+def analyze_page_with_ai(client, page, model, target_keyword=None):
+    if target_keyword:
+        keyword_line = (
+            f"The site owner has specified this page's target keyword/topic as: {target_keyword!r}. "
+            "Judge fit against this specific target."
+        )
+    else:
+        keyword_line = (
+            "No target keyword was specified — infer the page's likely intended topic/keyword from "
+            "its own title, headings, and content, and say so."
+        )
+
+    user_content = (
+        f"URL: {page.url}\n"
+        f"Language: {'English' if page.lang == 'en' else 'Japanese'}\n"
+        f"{keyword_line}\n\n"
+        f"Title tag ({len(page.title)} chars): {page.title!r}\n"
+        f"Meta description ({len(page.meta_description)} chars): {page.meta_description!r}\n"
+        f"H1: {page.h1_list}\n"
+        f"H2s: {page.h2_list}\n\n"
+        f"Main page content:\n{page.content_text}"
+    )
+
+    response = client.messages.parse(
+        model=model,
+        max_tokens=1024,
+        system=AI_ANALYSIS_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": user_content}],
+        output_format=PageAIAnalysis,
+    )
+    return response.parsed_output
+
+
+def run_ai_analysis(pages, model, keyword_map):
+    import anthropic
+
+    client = anthropic.Anthropic()
+    ok_pages = [p for p in pages if p.ok]
+    results = {}
+    print(f"Running AI content/keyword analysis on {len(ok_pages)} pages using {model} ...")
+    for i, p in enumerate(ok_pages, 1):
+        target_keyword = keyword_map.get(p.url.rstrip("/"))
+        print(f"  [{i}/{len(ok_pages)}] {p.url}")
+        try:
+            results[p.url] = analyze_page_with_ai(client, p, model, target_keyword)
+        except Exception as e:
+            print(f"    AI analysis failed: {e}", file=sys.stderr)
+    return results
+
+
+# --------------------------------------------------------------------------
 # XLSX report
 # --------------------------------------------------------------------------
 
@@ -725,7 +830,7 @@ def write_issues_sheet(wb, issues):
         ws.cell(row=summary_row, column=2 + i, value=f"{sev}: {counts.get(sev, 0)}")
 
 
-def write_executive_summary(wb, pages, issues, pairs, unmatched_en, unmatched_ja, recurring_alt):
+def write_executive_summary(wb, pages, issues, pairs, unmatched_en, unmatched_ja, recurring_alt, ai_results=None):
     ws = wb.create_sheet("Executive Summary")
     ok_pages = [p for p in pages if p.ok]
     en_count = sum(1 for p in ok_pages if p.lang == "en")
@@ -814,6 +919,23 @@ def write_executive_summary(wb, pages, issues, pairs, unmatched_en, unmatched_ja
             state["row"] += 1
         state["row"] += 1
 
+    if ai_results:
+        subheader("AI content & keyword review")
+        rating_counts = defaultdict(int)
+        poor_pages = []
+        for url, r in ai_results.items():
+            rating_counts[r.overall_rating] += 1
+            if r.overall_rating == "Poor":
+                poor_pages.append(url)
+        line(
+            f"{len(ai_results)} page(s) reviewed. Good: {rating_counts.get('Good', 0)}, "
+            f"Needs Improvement: {rating_counts.get('Needs Improvement', 0)}, Poor: {rating_counts.get('Poor', 0)}."
+        )
+        if poor_pages:
+            line("Pages rated 'Poor' overall: " + truncate_join(sorted(poor_pages), 8))
+        line("Full per-page assessments and suggestions are in the AI Content & Keyword Analysis tab.")
+        state["row"] += 1
+
     subheader("Fix-first priority list")
     high_cats = sorted(c for c, s in counts_by_cat.items() if HIGH in s)
     med_cats = sorted(c for c, s in counts_by_cat.items() if MEDIUM in s and HIGH not in s)
@@ -833,6 +955,10 @@ def write_executive_summary(wb, pages, issues, pairs, unmatched_en, unmatched_ja
             f"Decide on the {len(content_gaps)} page(s) with no counterpart in the other language — "
             "translate for parity, or confirm it's intentional (see the table above)."
         )
+    if ai_results:
+        poor_count = sum(1 for r in ai_results.values() if r.overall_rating == "Poor")
+        if poor_count:
+            priorities.append(f"Review the {poor_count} page(s) the AI rated 'Poor' overall first.")
     if not priorities:
         priorities.append("No High or Medium severity issues found. Review Low/Info items opportunistically.")
     for idx, text in enumerate(priorities, 1):
@@ -848,13 +974,13 @@ def write_executive_summary(wb, pages, issues, pairs, unmatched_en, unmatched_ja
 
 
 def build_workbook(pages, issues, pairs, unmatched_en, unmatched_ja, broken_links, link_sources,
-                    thin_words, thin_chars, en_prefix=DEFAULT_EN_PREFIX):
+                    thin_words, thin_chars, en_prefix=DEFAULT_EN_PREFIX, ai_results=None):
     wb = Workbook()
     wb.remove(wb.active)
 
     write_issues_sheet(wb, issues)
     recurring_alt = find_recurring_missing_alt(pages)
-    write_executive_summary(wb, pages, issues, pairs, unmatched_en, unmatched_ja, recurring_alt)
+    write_executive_summary(wb, pages, issues, pairs, unmatched_en, unmatched_ja, recurring_alt, ai_results)
 
     # All Pages
     page_types = classify_page_types(pages, pairs, en_prefix, thin_words, thin_chars)
@@ -998,7 +1124,45 @@ def build_workbook(pages, issues, pairs, unmatched_en, unmatched_ja, broken_link
             ws.cell(row=i, column=1, value=url)
             ws.cell(row=i, column=2, value=lang)
 
+    if ai_results:
+        write_ai_analysis_sheet(wb, pages, ai_results)
+
     return wb
+
+
+RATING_FILL = {
+    "Poor": PatternFill("solid", fgColor="FFC7CE"),
+    "Needs Improvement": PatternFill("solid", fgColor="FFEB9C"),
+    "Good": PatternFill("solid", fgColor="C6EFCE"),
+}
+
+
+def write_ai_analysis_sheet(wb, pages, ai_results):
+    headers = [
+        "URL", "Language", "Keyword/Topic", "Keyword Inferred?",
+        "Title Rating", "Title Assessment", "Meta Rating", "Meta Assessment",
+        "Content Rating", "Content Assessment", "Overall Rating", "Suggestions",
+    ]
+    ws = write_sheet(wb, "AI Content & Keyword Analysis", headers, [],
+                      col_widths=[45, 6, 25, 10, 14, 45, 14, 45, 14, 45, 14, 60])
+
+    rating_cols = {5: "title_rating", 7: "meta_description_rating", 9: "content_rating", 11: "overall_rating"}
+    for p in sorted(pages, key=lambda x: (x.lang, x.url)):
+        r = ai_results.get(p.url)
+        if not r:
+            continue
+        ws.append([
+            p.url, p.lang, r.keyword_or_topic, "Yes" if r.keyword_is_inferred else "No",
+            r.title_rating, r.title_assessment,
+            r.meta_description_rating, r.meta_description_assessment,
+            r.content_rating, r.content_assessment,
+            r.overall_rating, "; ".join(r.suggestions),
+        ])
+        row_idx = ws.max_row
+        for col_idx, attr in rating_cols.items():
+            fill = RATING_FILL.get(getattr(r, attr))
+            if fill:
+                ws.cell(row=row_idx, column=col_idx).fill = fill
 
 
 # --------------------------------------------------------------------------
@@ -1024,6 +1188,15 @@ def parse_args(argv=None):
                      help="Fetch a single URL and print diagnostics about what content was extracted "
                           "and why (use this to troubleshoot an unexpected word/char count) instead "
                           "of running a full audit")
+    ap.add_argument("--ai-analysis", action="store_true",
+                     help="Use the Claude API to judge keyword fit, meta quality, and content quality "
+                          "per page (costs a small amount per run — see README). Requires "
+                          "ANTHROPIC_API_KEY in the environment.")
+    ap.add_argument("--ai-model", default=DEFAULT_AI_MODEL,
+                     help=f"Claude model to use for --ai-analysis (default: {DEFAULT_AI_MODEL})")
+    ap.add_argument("--ai-keyword-map", default=None,
+                     help="Optional CSV file with 'url' and 'keyword' columns giving explicit target "
+                          "keywords for specific pages; pages not listed fall back to AI-inferred topic")
     return ap.parse_args(argv)
 
 
@@ -1091,6 +1264,12 @@ def debug_single_url(session, url, en_prefix, timeout):
 
 def main(argv=None):
     args = parse_args(argv)
+
+    if args.ai_analysis and not (os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")):
+        print("ERROR: --ai-analysis requires ANTHROPIC_API_KEY (or ANTHROPIC_AUTH_TOKEN) to be set "
+              "in the environment.", file=sys.stderr)
+        return 1
+
     base_netloc = normalize_netloc(urlparse(args.base_url).netloc)
 
     session = requests.Session()
@@ -1157,9 +1336,14 @@ def main(argv=None):
     issues = generate_issues(pages, pairs, unmatched_en, unmatched_ja, broken_links, link_sources,
                               dup_titles, dup_meta, args.thin_words, args.thin_chars, args.en_prefix)
 
+    ai_results = None
+    if args.ai_analysis:
+        keyword_map = load_keyword_map(args.ai_keyword_map) if args.ai_keyword_map else {}
+        ai_results = run_ai_analysis(pages, args.ai_model, keyword_map)
+
     print("Writing workbook ...")
     wb = build_workbook(pages, issues, pairs, unmatched_en, unmatched_ja, broken_links, link_sources,
-                         args.thin_words, args.thin_chars, args.en_prefix)
+                         args.thin_words, args.thin_chars, args.en_prefix, ai_results)
     wb.save(args.output)
 
     counts = defaultdict(int)

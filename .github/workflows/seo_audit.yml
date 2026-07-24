@@ -12,6 +12,11 @@ on:
         required: false
         default: false
         type: boolean
+      ai_analysis:
+        description: "Also run AI keyword/meta/content quality review (costs a small amount per run — needs the ANTHROPIC_API_KEY repo secret)"
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   audit:
@@ -28,6 +33,8 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Run SEO audit
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           ARGS=()
           if [ -n "${{ github.event.inputs.max_pages }}" ]; then
@@ -35,6 +42,9 @@ jobs:
           fi
           if [ "${{ github.event.inputs.skip_broken_links }}" = "true" ]; then
             ARGS+=(--skip-broken-links)
+          fi
+          if [ "${{ github.event.inputs.ai_analysis }}" = "true" ]; then
+            ARGS+=(--ai-analysis)
           fi
           python seo_audit.py --output passot_seo_audit.xlsx "${ARGS[@]}"
 

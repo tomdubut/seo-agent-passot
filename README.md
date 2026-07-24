@@ -5,8 +5,10 @@ pages under `/en/`, JP pages at the root). Crawls the site via
 `sitemap.xml`, extracts on-page SEO signals, flags issues, compares EN/JP
 counterparts, and writes everything to a single XLSX workbook.
 
-No accounts, API keys, or scheduling required — this only reads pages
-that are already public on the site.
+No accounts, API keys, or scheduling required for the core audit — it
+only reads pages that are already public on the site. An optional
+`--ai-analysis` mode (see below) adds AI-judged keyword/content quality
+and does need an Anthropic API key.
 
 ## Setup
 
@@ -37,6 +39,9 @@ Useful flags (see `python seo_audit.py --help` for the full list):
 | `--thin-words N` / `--thin-chars N` | Fallback thin-content thresholds for pages that don't match a known page type below (default: 300 words for EN, 600 characters for JP) |
 | `--delay SECONDS` | Seconds between requests (default 0.8s — increase if the site starts rate-limiting you) |
 | `--debug-url URL` | Fetch a single URL and print exactly which container was used for word/char count, and why — use this to troubleshoot an unexpected 0 or very low count instead of running a full audit |
+| `--ai-analysis` | Also run an AI (Claude) review of keyword fit, meta quality, and content quality per page — see below. Requires `ANTHROPIC_API_KEY` in the environment. |
+| `--ai-model MODEL` | Model to use for `--ai-analysis` (default: `claude-sonnet-5`) |
+| `--ai-keyword-map FILE.csv` | CSV with `url,keyword` columns giving explicit target keywords for specific pages — see below |
 
 If the site blocks the crawler (403s), it's likely a WAF/bot-protection
 rule reacting to the request pattern or User-Agent — try `--delay 2` first,
@@ -70,6 +75,42 @@ Content issue names the page type it was judged against — check both if a
 flag looks wrong, and adjust the rules in `PAGE_TYPE_BY_FIRST_SEGMENT`,
 `UTILITY_TOKENS`, etc. near the top of `seo_audit.py` to match your own
 URL structure and content strategy.
+
+## AI content & keyword review (optional, `--ai-analysis`)
+
+Everything else in this tool is a mechanical check (presence, length,
+duplication) — it can't judge whether a page is actually *good* for the
+keyword it's trying to rank for. `--ai-analysis` adds that: it sends each
+page's title, meta description, headings, and main content to Claude and
+asks for a genuine qualitative judgment — keyword/topic fit, whether the
+title and meta description are compelling (not just present), whether the
+content substantively covers the topic, and concrete suggestions. Results
+land in their own **AI Content & Keyword Analysis** tab, color-coded
+Good/Needs Improvement/Poor, plus a short rollup in the Executive Summary.
+
+**Setup:**
+1. Requires an Anthropic API key (console.anthropic.com).
+2. Locally: `export ANTHROPIC_API_KEY=your-key` before running.
+3. Via GitHub Actions: add it as a repo secret named `ANTHROPIC_API_KEY`
+   (Settings → Secrets and variables → Actions → New repository secret),
+   then tick "ai_analysis" when you run the workflow.
+
+**Cost:** roughly $0.20–$1 for a full ~60-page run depending on the model
+(Sonnet 5 is the default and lands around $0.40) — small, but not free
+like the rest of the tool, and it's a real network call each time you run
+it, so it's opt-in rather than bundled into every run.
+
+**Target keywords:** by default the AI infers each page's apparent target
+topic from its own content — useful for a general quality read, but it's
+judging the page against a guess it made from that same page. If you have
+real target keywords in mind, pass `--ai-keyword-map keywords.csv` with
+`url,keyword` columns; listed pages get judged against your actual intent
+instead, which is far more useful for catching true gaps ("this page is
+trying to rank for X but never actually says X"). Note: there's no
+`<meta name="keywords">` or Yoast/RankMath "focus keyphrase" to crawl for
+this automatically — the focus keyphrase lives only in the WordPress
+editor, never in the public HTML, and the old `keywords` meta tag has been
+ignored by Google since ~2009 — so a keyword list has to come from you.
 
 ## What it checks
 
@@ -119,15 +160,16 @@ Severity guide:
 
 ## What it can't tell you (and why)
 
-This audits pages that already exist. It intentionally does **not**
-attempt to identify content or pages you don't have yet (keyword gaps,
-"what are people searching for that you don't rank for") — that needs
-real search-demand data (Google Search Console query data or a keyword
-research tool), which isn't wired up here, and fabricating numbers that
-look like search volume would be worse than not having them. The
-translation-parity and weak-internal-linking checks above are as close as
-this tool gets to "opportunities," and both are derived only from data
-it already crawled — nothing invented.
+This audits pages that already exist. Even with `--ai-analysis` turned on,
+it does **not** attempt to identify content or pages you don't have yet
+(keyword gaps, "what are people searching for that you don't rank for")
+— that needs real search-demand data (Google Search Console query data or
+a keyword research tool), which isn't wired up here, and fabricating
+numbers that look like search volume would be worse than not having them.
+`--ai-analysis` judges how well an *existing* page fits a keyword (inferred
+or one you provide) — it doesn't discover keywords you're missing
+entirely. The translation-parity and weak-internal-linking checks are the
+closest this tool gets to "opportunities" from crawled data alone.
 
 ## Known limitations
 
