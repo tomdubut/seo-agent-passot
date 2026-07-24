@@ -467,6 +467,42 @@ def generate_issues(pages, pairs, unmatched_en, unmatched_ja, broken_links, link
     return issues
 
 
+def find_recurring_missing_alt(pages, min_pages=2):
+    """Images missing alt text on multiple pages usually means one shared
+    template component (e.g. a CTA icon), not N separate mistakes."""
+    src_to_pages = defaultdict(set)
+    for p in pages:
+        if not p.ok:
+            continue
+        for src in p.missing_alt_examples:
+            src_to_pages[src].add(p.url)
+    return {src: urls for src, urls in src_to_pages.items() if len(urls) >= min_pages}
+
+
+# One-line recommended action + rough effort per issue category, used in the
+# Executive Summary tab. Effort is a coarse hint, not an estimate in hours:
+# Quick = a single-field fix, Medium = template/many-page fix, Involved = needs
+# real content work, Strategic = a judgment call, not a "bug".
+CATEGORY_GUIDANCE = {
+    "Page Unreachable": ("Fix the broken URL or update/remove links and sitemap entries pointing to it.", "Quick"),
+    "Missing Title": ("Add a unique, descriptive <title> tag.", "Quick"),
+    "Duplicate Title": ("Differentiate the title tag on each affected page.", "Quick"),
+    "Missing Meta Description": ("Write a unique meta description (roughly 50-160 characters).", "Quick"),
+    "Duplicate Meta Description": ("Differentiate the meta description on each affected page.", "Quick"),
+    "Missing Canonical": ("Add a self-referencing canonical tag.", "Quick"),
+    "Canonical Mismatch": ("Confirm the canonical target is correct; fix if it points to the wrong URL.", "Quick"),
+    "Missing H1": ("Add a single, descriptive H1 to the page's main content.", "Quick"),
+    "Multiple H1": ("Keep one H1; demote the rest to H2/H3.", "Quick"),
+    "Missing Alt Text": ("Add descriptive alt text — check the Executive Summary's recurring-image table first.", "Medium"),
+    "Thin Content": ("Expand the page with more substantive, unique copy.", "Involved"),
+    "Broken Internal Link": ("Fix or remove the link, or update it to the correct URL.", "Quick"),
+    "Sitemap Redirect": ("Point the sitemap/internal links at the final URL directly.", "Quick"),
+    "Missing Hreflang Cross-Link": ("Add reciprocal hreflang tags linking the EN and JP versions.", "Medium"),
+    "EN/JP Inconsistency": ("Review and align content between the EN and JP versions of the page.", "Medium"),
+    "No Language Counterpart": ("Confirm this is intentional (e.g. JP-only blog content); translate if not.", "Strategic"),
+}
+
+
 # --------------------------------------------------------------------------
 # XLSX report
 # --------------------------------------------------------------------------
@@ -525,11 +561,111 @@ def write_issues_sheet(wb, issues):
         ws.cell(row=summary_row, column=2 + i, value=f"{sev}: {counts.get(sev, 0)}")
 
 
+def write_executive_summary(wb, pages, issues, pairs, unmatched_en, unmatched_ja, recurring_alt):
+    ws = wb.create_sheet("Executive Summary")
+    ok_pages = [p for p in pages if p.ok]
+    en_count = sum(1 for p in ok_pages if p.lang == "en")
+    ja_count = sum(1 for p in ok_pages if p.lang == "ja")
+
+    state = {"row": 1}
+
+    def header(text, size=14):
+        c = ws.cell(row=state["row"], column=1, value=text)
+        c.font = Font(bold=True, size=size)
+        state["row"] += 2
+
+    def subheader(text):
+        c = ws.cell(row=state["row"], column=1, value=text)
+        c.font = Font(bold=True, size=11, color="305496")
+        state["row"] += 1
+
+    def line(text=""):
+        ws.cell(row=state["row"], column=1, value=text)
+        state["row"] += 1
+
+    def table_header(cols):
+        for idx, col_name in enumerate(cols, 1):
+            cell = ws.cell(row=state["row"], column=idx, value=col_name)
+            cell.font = HEADER_FONT
+            cell.fill = HEADER_FILL
+        state["row"] += 1
+
+    header("Passot SEO Audit — Executive Summary")
+    line(f"Pages audited: {len(ok_pages)}  ({en_count} EN, {ja_count} JP)")
+    line(f"EN/JP pairs matched: {len(pairs)}  |  Unmatched: {len(unmatched_en)} EN-only, {len(unmatched_ja)} JP-only")
+    state["row"] += 1
+
+    counts_by_sev = defaultdict(int)
+    counts_by_cat = defaultdict(lambda: defaultdict(int))
+    for i in issues:
+        counts_by_sev[i.severity] += 1
+        counts_by_cat[i.category][i.severity] += 1
+
+    subheader("Issues by severity")
+    for sev in [HIGH, MEDIUM, LOW, INFO]:
+        line(f"{sev}: {counts_by_sev.get(sev, 0)}")
+    state["row"] += 1
+
+    subheader("Issues by category")
+    table_header(["Category", "Count", "Worst Severity", "Recommended Action", "Effort"])
+    cat_totals = sorted(counts_by_cat.items(), key=lambda kv: (SEVERITY_ORDER.get(min(kv[1], key=lambda s: SEVERITY_ORDER.get(s, 9)), 9), -sum(kv[1].values())))
+    for cat, sev_counts in cat_totals:
+        total = sum(sev_counts.values())
+        worst = min(sev_counts.keys(), key=lambda s: SEVERITY_ORDER.get(s, 9))
+        action, effort = CATEGORY_GUIDANCE.get(cat, ("Review the flagged pages.", "Medium"))
+        ws.cell(row=state["row"], column=1, value=cat)
+        ws.cell(row=state["row"], column=2, value=total)
+        ws.cell(row=state["row"], column=3, value=worst)
+        ws.cell(row=state["row"], column=4, value=action)
+        ws.cell(row=state["row"], column=5, value=effort)
+        state["row"] += 1
+    state["row"] += 1
+
+    if recurring_alt:
+        subheader("Recurring root causes (fix once, resolves many pages)")
+        table_header(["Shared Image", "Pages Affected", "Example Pages"])
+        for src, urls in sorted(recurring_alt.items(), key=lambda kv: -len(kv[1]))[:20]:
+            ws.cell(row=state["row"], column=1, value=src)
+            ws.cell(row=state["row"], column=2, value=len(urls))
+            ws.cell(row=state["row"], column=3, value=truncate_join(sorted(urls), 3))
+            state["row"] += 1
+        state["row"] += 1
+
+    subheader("Fix-first priority list")
+    high_cats = sorted(c for c, s in counts_by_cat.items() if HIGH in s)
+    med_cats = sorted(c for c, s in counts_by_cat.items() if MEDIUM in s and HIGH not in s)
+    priorities = []
+    if high_cats:
+        priorities.append("Address High severity issues first: " + ", ".join(high_cats) + ".")
+    if recurring_alt:
+        instances = sum(len(urls) for urls in recurring_alt.values())
+        priorities.append(
+            f"Fix the {len(recurring_alt)} shared/reused image(s) missing alt text once — "
+            f"together they account for {instances} page-level flags."
+        )
+    if med_cats:
+        priorities.append("Schedule Medium severity issues next: " + ", ".join(med_cats) + ".")
+    if not priorities:
+        priorities.append("No High or Medium severity issues found. Review Low/Info items opportunistically.")
+    for idx, text in enumerate(priorities, 1):
+        line(f"{idx}. {text}")
+    line()
+    line("Full page-by-page detail behind every number above is in the Issues Summary tab.")
+
+    for idx, width in enumerate([45, 12, 16, 60, 10], 1):
+        ws.column_dimensions[get_column_letter(idx)].width = width
+
+    wb.move_sheet("Executive Summary", offset=-len(wb.sheetnames))
+    return ws
+
+
 def build_workbook(pages, issues, pairs, unmatched_en, unmatched_ja, broken_links, link_sources, thin_words, thin_chars):
     wb = Workbook()
     wb.remove(wb.active)
 
     write_issues_sheet(wb, issues)
+    recurring_alt = find_recurring_missing_alt(pages)
+    write_executive_summary(wb, pages, issues, pairs, unmatched_en, unmatched_ja, recurring_alt)
 
     # All Pages
     rows = []
