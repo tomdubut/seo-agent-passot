@@ -1,0 +1,46 @@
+name: SEO Audit
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_pages:
+        description: "Limit number of pages crawled (leave blank for a full run)"
+        required: false
+        default: ""
+      skip_broken_links:
+        description: "Skip broken-link checking (faster run)"
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run SEO audit
+        run: |
+          ARGS=()
+          if [ -n "${{ github.event.inputs.max_pages }}" ]; then
+            ARGS+=(--max-pages "${{ github.event.inputs.max_pages }}")
+          fi
+          if [ "${{ github.event.inputs.skip_broken_links }}" = "true" ]; then
+            ARGS+=(--skip-broken-links)
+          fi
+          python seo_audit.py --output passot_seo_audit.xlsx "${ARGS[@]}"
+
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: passot-seo-audit
+          path: passot_seo_audit.xlsx
+          retention-days: 30
