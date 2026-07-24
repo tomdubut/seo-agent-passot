@@ -14,6 +14,7 @@ Run `python seo_audit.py --help` for all options.
 """
 
 import argparse
+import json
 import re
 import sys
 import time
@@ -89,6 +90,9 @@ class Page:
     word_count: int = None
     char_count: int = None
     http_last_modified: str = ""
+    structured_data_types: list = field(default_factory=list)
+    og_tags: dict = field(default_factory=dict)
+    twitter_card: bool = False
 
     @property
     def ok(self):
@@ -249,6 +253,38 @@ def extract_head_fields(soup):
     return title, meta_description, canonical, hreflang, h1_list, h2_list
 
 
+def extract_structured_data(soup):
+    """Presence-only check: JSON-LD @type values, Open Graph tags, Twitter Card.
+    Does not validate schema correctness, just whether it's there at all."""
+    ld_types = []
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string or "")
+        except (ValueError, TypeError):
+            continue
+        for item in data if isinstance(data, list) else [data]:
+            if not isinstance(item, dict):
+                continue
+            for node in item.get("@graph", [item]):
+                if not isinstance(node, dict):
+                    continue
+                t = node.get("@type")
+                if isinstance(t, list):
+                    ld_types.extend(str(x) for x in t)
+                elif t:
+                    ld_types.append(str(t))
+
+    og_tags = {}
+    for meta in soup.find_all("meta", property=re.compile("^og:", re.I)):
+        content = (meta.get("content") or "").strip()
+        if content:
+            og_tags[meta["property"].lower()] = content
+
+    twitter_card = bool(soup.find("meta", attrs={"name": re.compile("^twitter:card$", re.I)}))
+
+    return sorted(set(ld_types)), og_tags, twitter_card
+
+
 def extract_content_metrics(soup, lang):
     container = find_main_container(soup)
     # Re-parse a copy so we can strip boilerplate without mutating `soup`
@@ -291,6 +327,7 @@ def build_page(session, url, lang, sitemap_lastmod, timeout, base_netloc):
     page.all_internal_links = resolve_links(soup.find_all("a", href=True), url, base_netloc)
     (page.title, page.meta_description, page.canonical, page.hreflang,
      page.h1_list, page.h2_list) = extract_head_fields(soup)
+    (page.structured_data_types, page.og_tags, page.twitter_card) = extract_structured_data(soup)
     (page.word_count, page.char_count, page.image_total,
      page.missing_alt_examples, main_link_tags) = extract_content_metrics(soup, lang)
     page.image_missing_alt = len(page.missing_alt_examples)
@@ -348,6 +385,77 @@ def pair_pages(pages, en_prefix):
     return pairs, unmatched_en, unmatched_ja
 
 
+# Thin-content thresholds are not a real Google ranking signal (there is no
+# official minimum word count) — they're a heuristic proxy for "might not be
+# substantive," so one number for an entire site is a blunt instrument. A
+# product spec page and a competitive blog article don't need the same bar.
+# EXEMPT means "this page type is legitimately short by design, don't flag it
+# at all" (e.g. a homepage or a blog listing page).
+EXEMPT = "exempt"
+
+# (label, word threshold for EN, char threshold for JP) keyed by first URL
+# path segment (after stripping the EN prefix) or, for Utility, by any
+# hyphen-separated token in the path. Tune these to match your own site's
+# URL structure and content strategy.
+PAGE_TYPE_BY_FIRST_SEGMENT = {
+    "products": ("Product", 150, 300),
+    "retail-displays": ("Product", 150, 300),
+    "company": ("Company/About", 150, 300),
+    "about": ("Company/About", 150, 300),
+    "our-process": ("Company/About", 150, 300),
+    "process-retail-display": ("Company/About", 150, 300),
+}
+UTILITY_TOKENS = {"contact", "faq", "privacy", "terms", "security", "policy"}
+BLOG_INDEX_SEGMENTS = {"column", "blog"}
+
+
+def classify_page_type_by_path(url, en_prefix):
+    path = urlparse(url).path
+    if en_prefix and path.startswith(en_prefix):
+        path = "/" + path[len(en_prefix):]
+    path = path.strip("/")
+    if not path:
+        return "Homepage", EXEMPT, EXEMPT
+
+    segments = path.split("/")
+    if len(segments) == 1 and segments[0] in BLOG_INDEX_SEGMENTS:
+        return "Blog Index", EXEMPT, EXEMPT
+    if segments[0] in PAGE_TYPE_BY_FIRST_SEGMENT:
+        return PAGE_TYPE_BY_FIRST_SEGMENT[segments[0]]
+
+    tokens = set(re.split(r"[-_]", path.lower()))
+    if tokens & UTILITY_TOKENS:
+        return "Utility", 80, 150
+    if segments[0].startswith("column") or "column" in tokens:
+        return "Blog/Column Article", 600, 1000
+
+    return None
+
+
+def classify_page_types(pages, pairs, en_prefix, default_words, default_chars):
+    """URL-path classification first. EN pages with no keyword match (e.g.
+    SEO-friendly slugs that share no vocabulary with their JP counterpart's
+    URL) inherit their JP pair's classification instead of guessing — that's
+    real matched data, not a fabricated signal. Anything still unclassified
+    falls back to the site-wide --thin-words/--thin-chars default."""
+    by_url = {}
+    for p in pages:
+        by_url[p.url] = classify_page_type_by_path(p.url, en_prefix)
+
+    for en_page, ja_page in pairs:
+        if by_url.get(en_page.url) is None and by_url.get(ja_page.url) is not None:
+            by_url[en_page.url] = by_url[ja_page.url]
+
+    result = {}
+    for p in pages:
+        classified = by_url.get(p.url)
+        if classified is None:
+            result[p.url] = ("Other", default_words, default_chars)
+        else:
+            result[p.url] = classified
+    return result
+
+
 def check_broken_links(session, pages, timeout, delay, skip=False):
     crawled_status = {p.url.rstrip("/"): ("ERROR" if p.fetch_error else p.status_code) for p in pages}
 
@@ -370,13 +478,38 @@ def check_broken_links(session, pages, timeout, delay, skip=False):
     return results, link_sources
 
 
+def compute_inbound_link_counts(pages):
+    """How many other crawled pages link to each page from their main content
+    (nav/footer links excluded, since those are identical on every page and
+    would mask genuinely under-linked content)."""
+    urls_by_key = {p.url.rstrip("/"): p.url for p in pages}
+    inbound = defaultdict(set)
+    for p in pages:
+        if not p.ok:
+            continue
+        for link in p.internal_links:
+            key = link.rstrip("/")
+            target = urls_by_key.get(key)
+            if target and target != p.url:
+                inbound[target].add(p.url)
+    return inbound
+
+
 # --------------------------------------------------------------------------
 # Issue generation
 # --------------------------------------------------------------------------
 
+# Homepages are expected to have few/no inbound links from other pages'
+# main content (they're reached via nav, not content links) — exclude them
+# from the "weakly linked" check to avoid noise.
+WEAK_INBOUND_THRESHOLD = 1
+
 def generate_issues(pages, pairs, unmatched_en, unmatched_ja, broken_links, link_sources,
-                     dup_titles, dup_meta, thin_words, thin_chars):
+                     dup_titles, dup_meta, thin_words, thin_chars, en_prefix=DEFAULT_EN_PREFIX):
     issues = []
+    inbound_counts = compute_inbound_link_counts(pages)
+    page_types = classify_page_types(pages, pairs, en_prefix, thin_words, thin_chars)
+    homepage_paths = {"/", en_prefix.rstrip("/") or "/en"}
 
     def add(sev, cat, url, lang, detail):
         issues.append(Issue(sev, cat, url, lang, detail))
@@ -412,11 +545,29 @@ def generate_issues(pages, pairs, unmatched_en, unmatched_ja, broken_links, link
                 f"{p.image_missing_alt}/{p.image_total} images missing alt text: "
                 f"{truncate_join(p.missing_alt_examples, 3)}")
 
+        page_type, word_th, char_th = page_types.get(p.url, ("Other", thin_words, thin_chars))
+        threshold = word_th if p.lang == "en" else char_th
         content_len = p.word_count if p.lang == "en" else p.char_count
-        threshold = thin_words if p.lang == "en" else thin_chars
         unit = "words" if p.lang == "en" else "characters"
-        if content_len is not None and content_len < threshold:
-            add(MEDIUM, "Thin Content", p.url, p.lang, f"{content_len} {unit} of main content (threshold {threshold})")
+        if threshold != EXEMPT and content_len is not None and content_len < threshold:
+            add(MEDIUM, "Thin Content", p.url, p.lang,
+                f"{content_len} {unit} of main content (threshold {threshold} for page type '{page_type}')")
+
+        if not p.structured_data_types:
+            add(LOW, "Missing Structured Data", p.url, p.lang, "No JSON-LD structured data (schema.org) found on this page")
+
+        missing_og = [k for k in ("og:title", "og:description", "og:image") if k not in p.og_tags]
+        if missing_og:
+            add(LOW, "Missing Open Graph Tags", p.url, p.lang,
+                f"Missing: {', '.join(missing_og)} (affects link preview appearance on social/chat apps)")
+
+        path = urlparse(p.url).path.rstrip("/") or "/"
+        if path not in homepage_paths:
+            inbound = len(inbound_counts.get(p.url, set()))
+            if inbound <= WEAK_INBOUND_THRESHOLD:
+                add(LOW, "Weakly Linked Internally", p.url, p.lang,
+                    f"Only {inbound} other page(s) link to this page from their main content — "
+                    "consider adding internal links from related pages")
 
     for (lang, _text), urls in dup_titles.items():
         add(MEDIUM, "Duplicate Title", urls[0], lang, f"Same title used on {len(urls)} pages: {truncate_join(urls)}")
@@ -500,6 +651,9 @@ CATEGORY_GUIDANCE = {
     "Missing Hreflang Cross-Link": ("Add reciprocal hreflang tags linking the EN and JP versions.", "Medium"),
     "EN/JP Inconsistency": ("Review and align content between the EN and JP versions of the page.", "Medium"),
     "No Language Counterpart": ("Confirm this is intentional (e.g. JP-only blog content); translate if not.", "Strategic"),
+    "Missing Structured Data": ("Add JSON-LD schema.org markup (Article, FAQPage, Organization, etc. as relevant).", "Involved"),
+    "Missing Open Graph Tags": ("Add og:title, og:description and og:image meta tags for social/chat link previews.", "Quick"),
+    "Weakly Linked Internally": ("Add internal links to this page from related content elsewhere on the site.", "Quick"),
 }
 
 
@@ -631,6 +785,25 @@ def write_executive_summary(wb, pages, issues, pairs, unmatched_en, unmatched_ja
             state["row"] += 1
         state["row"] += 1
 
+    content_gaps = unmatched_en + unmatched_ja
+    if content_gaps:
+        subheader("Translation / content parity gaps (not in the Issues tab's severity ranking)")
+        line(f"{len(unmatched_ja)} JP page(s) have no English version. {len(unmatched_en)} EN page(s) have no Japanese version.")
+        line("Not necessarily wrong (e.g. intentionally JP-only blog posts) — but a deliberate content decision, not a bug to fix.")
+        table_header(["URL", "Language", "Content Length"])
+        for p in sorted(content_gaps, key=lambda x: (x.lang, x.url)):
+            if p.lang == "en" and p.word_count is not None:
+                length = f"{p.word_count} words"
+            elif p.char_count is not None:
+                length = f"{p.char_count} characters"
+            else:
+                length = ""
+            ws.cell(row=state["row"], column=1, value=p.url)
+            ws.cell(row=state["row"], column=2, value=p.lang)
+            ws.cell(row=state["row"], column=3, value=length)
+            state["row"] += 1
+        state["row"] += 1
+
     subheader("Fix-first priority list")
     high_cats = sorted(c for c, s in counts_by_cat.items() if HIGH in s)
     med_cats = sorted(c for c, s in counts_by_cat.items() if MEDIUM in s and HIGH not in s)
@@ -645,6 +818,11 @@ def write_executive_summary(wb, pages, issues, pairs, unmatched_en, unmatched_ja
         )
     if med_cats:
         priorities.append("Schedule Medium severity issues next: " + ", ".join(med_cats) + ".")
+    if content_gaps:
+        priorities.append(
+            f"Decide on the {len(content_gaps)} page(s) with no counterpart in the other language — "
+            "translate for parity, or confirm it's intentional (see the table above)."
+        )
     if not priorities:
         priorities.append("No High or Medium severity issues found. Review Low/Info items opportunistically.")
     for idx, text in enumerate(priorities, 1):
@@ -659,7 +837,8 @@ def write_executive_summary(wb, pages, issues, pairs, unmatched_en, unmatched_ja
     return ws
 
 
-def build_workbook(pages, issues, pairs, unmatched_en, unmatched_ja, broken_links, link_sources, thin_words, thin_chars):
+def build_workbook(pages, issues, pairs, unmatched_en, unmatched_ja, broken_links, link_sources,
+                    thin_words, thin_chars, en_prefix=DEFAULT_EN_PREFIX):
     wb = Workbook()
     wb.remove(wb.active)
 
@@ -668,22 +847,26 @@ def build_workbook(pages, issues, pairs, unmatched_en, unmatched_ja, broken_link
     write_executive_summary(wb, pages, issues, pairs, unmatched_en, unmatched_ja, recurring_alt)
 
     # All Pages
+    page_types = classify_page_types(pages, pairs, en_prefix, thin_words, thin_chars)
     rows = []
     for p in sorted(pages, key=lambda x: (x.lang, x.url)):
+        page_type, word_th, char_th = page_types.get(p.url, ("Other", thin_words, thin_chars))
+        threshold = word_th if p.lang == "en" else char_th
         rows.append([
             p.url, p.lang, p.status_code or p.fetch_error, p.title, len(p.title),
             p.meta_description, len(p.meta_description), p.canonical,
             len(p.h1_list), len(p.h2_list), p.image_total, p.image_missing_alt,
             p.internal_link_count, p.word_count if p.lang == "en" else "",
             p.char_count if p.lang == "ja" else "", p.http_last_modified, p.sitemap_lastmod,
-            len(p.hreflang),
+            len(p.hreflang), page_type, "exempt" if threshold == EXEMPT else threshold,
         ])
     write_sheet(wb, "All Pages", [
         "URL", "Language", "Status", "Title", "Title Length", "Meta Description",
         "Meta Length", "Canonical", "H1 Count", "H2 Count", "Image Count",
         "Images Missing Alt", "Internal Link Count", "Word Count (EN)",
         "Char Count (JP)", "Last-Modified (HTTP)", "Last-Modified (Sitemap)", "Hreflang Tag Count",
-    ], rows, col_widths=[45, 6, 8, 35, 10, 40, 10, 40, 8, 8, 8, 10, 10, 10, 10, 20, 14, 10])
+        "Page Type", "Thin-Content Threshold Used",
+    ], rows, col_widths=[45, 6, 8, 35, 10, 40, 10, 40, 8, 8, 8, 10, 10, 10, 10, 20, 14, 10, 16, 14])
 
     # Meta Descriptions
     dup_meta = find_duplicates(pages, lambda p: p.meta_description)
@@ -726,13 +909,33 @@ def build_workbook(pages, issues, pairs, unmatched_en, unmatched_ja, broken_link
                 rows, col_widths=[45, 6, 10, 10, 10, 60])
 
     # Internal Links (per page)
+    inbound_counts = compute_inbound_link_counts(pages)
     rows = []
     for p in sorted(pages, key=lambda x: (x.lang, x.url)):
         if not p.ok:
             continue
-        rows.append([p.url, p.lang, p.internal_link_count])
-    write_sheet(wb, "Internal Links", ["URL", "Language", "Internal Link Count (main content)"],
-                rows, col_widths=[45, 6, 30])
+        rows.append([p.url, p.lang, p.internal_link_count, len(inbound_counts.get(p.url, set()))])
+    write_sheet(wb, "Internal Links",
+                ["URL", "Language", "Outbound Links (main content)", "Inbound Links (from other pages' main content)"],
+                rows, col_widths=[45, 6, 22, 30])
+
+    # Structured Data & Social Tags
+    rows = []
+    for p in sorted(pages, key=lambda x: (x.lang, x.url)):
+        if not p.ok:
+            continue
+        rows.append([
+            p.url, p.lang, truncate_join(p.structured_data_types, 5) or "(none)",
+            "Yes" if p.og_tags else "No",
+            "Yes" if "og:title" in p.og_tags else "No",
+            "Yes" if "og:description" in p.og_tags else "No",
+            "Yes" if "og:image" in p.og_tags else "No",
+            "Yes" if p.twitter_card else "No",
+        ])
+    write_sheet(wb, "Structured Data & Social", [
+        "URL", "Language", "JSON-LD Types Found", "Has Open Graph Tags?",
+        "OG Title?", "OG Description?", "OG Image?", "Twitter Card?",
+    ], rows, col_widths=[45, 6, 35, 16, 10, 14, 10, 12])
 
     # Broken Links
     rows = []
@@ -873,11 +1076,11 @@ def main(argv=None):
 
     print("Generating issue list ...")
     issues = generate_issues(pages, pairs, unmatched_en, unmatched_ja, broken_links, link_sources,
-                              dup_titles, dup_meta, args.thin_words, args.thin_chars)
+                              dup_titles, dup_meta, args.thin_words, args.thin_chars, args.en_prefix)
 
     print("Writing workbook ...")
     wb = build_workbook(pages, issues, pairs, unmatched_en, unmatched_ja, broken_links, link_sources,
-                         args.thin_words, args.thin_chars)
+                         args.thin_words, args.thin_chars, args.en_prefix)
     wb.save(args.output)
 
     counts = defaultdict(int)
