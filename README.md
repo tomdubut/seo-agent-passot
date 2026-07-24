@@ -34,13 +34,41 @@ Useful flags (see `python seo_audit.py --help` for the full list):
 | `--max-pages N` | Crawl only the first N pages — good for a quick smoke test before a full run |
 | `--skip-broken-links` | Skip internal link status checks (faster, but you lose that check) |
 | `--output FILE.xlsx` | Change the output filename |
-| `--thin-words N` / `--thin-chars N` | Adjust the thin-content thresholds (default: 300 words for EN, 600 characters for JP) |
+| `--thin-words N` / `--thin-chars N` | Fallback thin-content thresholds for pages that don't match a known page type below (default: 300 words for EN, 600 characters for JP) |
 | `--delay SECONDS` | Seconds between requests (default 0.8s — increase if the site starts rate-limiting you) |
 
 If the site blocks the crawler (403s), it's likely a WAF/bot-protection
 rule reacting to the request pattern or User-Agent — try `--delay 2` first,
 or check whether your host's security plugin is challenging automated
 requests from your IP.
+
+## About the thin-content thresholds
+
+Google has no official minimum word count — word count is not a ranking
+factor. The threshold here is a heuristic proxy ("very short pages are
+often not substantive"), and a single number for the whole site is a blunt
+instrument: a contact page and a competitive blog article shouldn't be
+held to the same bar. So the check classifies each page by URL pattern
+and applies a different threshold per type:
+
+| Page type | How it's detected | EN threshold | JP threshold |
+|---|---|---|---|
+| Homepage | path is `/` or the EN prefix root | exempt | exempt |
+| Blog Index | path is exactly `/column/` or `/en/blog/` | exempt | exempt |
+| Product | first path segment is `products` or `retail-displays` | 150 words | 300 chars |
+| Company/About | first path segment is `company`, `about`, `our-process`, etc. | 150 words | 300 chars |
+| Utility (contact/FAQ/policy) | path contains one of those keywords | 80 words | 150 chars |
+| Blog/Column Article | first segment starts with `column`, or the page's matched EN/JP counterpart does | 600 words | 1000 chars |
+| Other (unclassified) | fallback | `--thin-words` (300) | `--thin-chars` (600) |
+
+EN pages with no keyword match in their own URL (common with SEO-friendly
+slugs) inherit their JP counterpart's classification via the already-matched
+EN/JP pair, rather than guessing from scratch. The "All Pages" tab shows
+which page type and threshold was applied to every page, and each Thin
+Content issue names the page type it was judged against — check both if a
+flag looks wrong, and adjust the rules in `PAGE_TYPE_BY_FIRST_SEGMENT`,
+`UTILITY_TOKENS`, etc. near the top of `seo_audit.py` to match your own
+URL structure and content strategy.
 
 ## What it checks
 
