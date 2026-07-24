@@ -32,8 +32,8 @@ from openpyxl.utils import get_column_letter
 # Config defaults (override via CLI flags — see --help)
 # --------------------------------------------------------------------------
 
-DEFAULT_BASE_URL = "https://passot.co.jp"
-DEFAULT_SITEMAP_URL = "https://passot.co.jp/sitemap_index.xml"
+DEFAULT_BASE_URL = "https://www.passot.co.jp"
+DEFAULT_SITEMAP_URL = "https://www.passot.co.jp/sitemap_index.xml"
 DEFAULT_EN_PREFIX = "/en/"
 DEFAULT_OUTPUT = "passot_seo_audit.xlsx"
 DEFAULT_DELAY = 0.8

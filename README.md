@@ -22,7 +22,7 @@ pip install -r requirements.txt
 python seo_audit.py
 ```
 
-This crawls `https://passot.co.jp` using `https://passot.co.jp/sitemap_index.xml`
+This crawls `https://www.passot.co.jp` using `https://www.passot.co.jp/sitemap_index.xml`
 and writes `passot_seo_audit.xlsx` in the current directory. A full run of
 ~100-120 pages (EN + JP) takes a few minutes at the default request pace.
 
