@@ -30,6 +30,10 @@ on:
         description: "GA4 numeric Property ID (only used if search_data is checked)"
         required: false
         default: ""
+      gsc_import_path:
+        description: "Path in this repo to a Search Console export file to import (e.g. gsc-exports/performance.xlsx) — upload it via GitHub's web UI first. Alternative to gsc_site_url when you don't have Search Console admin access."
+        required: false
+        default: ""
 
 jobs:
   audit:
@@ -68,6 +72,9 @@ jobs:
             if [ -n "${{ github.event.inputs.ga4_property_id }}" ]; then
               ARGS+=(--ga4-property-id "${{ github.event.inputs.ga4_property_id }}")
             fi
+          fi
+          if [ -n "${{ github.event.inputs.gsc_import_path }}" ]; then
+            ARGS+=(--gsc-import "${{ github.event.inputs.gsc_import_path }}")
           fi
           python seo_audit.py --output passot_seo_audit.xlsx "${ARGS[@]}"
 
