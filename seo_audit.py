@@ -28,7 +28,7 @@ from urllib.parse import urljoin, urlparse, urldefrag
 
 import requests
 from bs4 import BeautifulSoup
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from pydantic import BaseModel
@@ -902,6 +902,109 @@ def fetch_gsc_data(credentials, site_url, days):
     return results
 
 
+def _read_gsc_export_csv(path):
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        return [row for row in csv.reader(f)]
+
+
+def _read_gsc_export_xlsx(path):
+    # GSC's Excel export has one sheet per dimension (Queries, Pages,
+    # Countries, Devices, ...). Prefer the per-page one.
+    wb = load_workbook(path, data_only=True, read_only=True)
+    preferred = [n for n in wb.sheetnames if "page" in n.lower()]
+    sheet = wb[preferred[0]] if preferred else wb[wb.sheetnames[0]]
+    return [["" if v is None else v for v in row] for row in sheet.iter_rows(values_only=True)]
+
+
+def _find_col(header, *aliases):
+    normalized = [str(h).strip().lower() for h in header]
+    for alias in aliases:
+        if alias in normalized:
+            return normalized.index(alias)
+    for alias in aliases:
+        for i, h in enumerate(normalized):
+            if alias in h:
+                return i
+    return None
+
+
+def _to_number(value):
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().replace(",", "").replace("%", "")
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _to_ctr_fraction(value):
+    """CSV exports write CTR as text like "3.5%"; XLSX exports write it as a
+    raw fraction cell (0.035). Key off the literal '%' rather than magnitude,
+    since a percentage under 1% (e.g. "0.6%") would otherwise be
+    indistinguishable from an already-fractional value."""
+    if value is None:
+        return None
+    is_percent_text = isinstance(value, str) and "%" in value
+    number = _to_number(value)
+    if number is None:
+        return None
+    return number / 100 if is_percent_text else number
+
+
+def load_gsc_export(path):
+    """Loads a manually-exported Search Console Performance report (CSV or
+    Excel, "Pages" tab) as a credential-free alternative to fetch_gsc_data()
+    for accounts without Search Console admin access. Returns the same shape:
+    {page_url: {clicks, impressions, ctr, avg_position, top_query}}. Per-page
+    top query isn't available from this export, so it's left blank."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".xlsx", ".xlsm"):
+        rows = _read_gsc_export_xlsx(path)
+    elif ext == ".csv":
+        rows = _read_gsc_export_csv(path)
+    else:
+        raise ValueError(f"Unsupported file type for --gsc-import: '{ext}' (use .csv or .xlsx)")
+
+    rows = [r for r in rows if any(str(c).strip() for c in r)]
+    if not rows:
+        raise ValueError(f"No rows found in {path}")
+
+    header, data_rows = rows[0], rows[1:]
+    page_col = _find_col(header, "top pages", "page", "landing page", "url")
+    clicks_col = _find_col(header, "clicks")
+    impressions_col = _find_col(header, "impressions")
+    ctr_col = _find_col(header, "ctr")
+    position_col = _find_col(header, "position", "average position", "avg. position", "avg position")
+
+    if page_col is None or clicks_col is None or impressions_col is None:
+        raise ValueError(
+            f"Could not find Page/Clicks/Impressions columns in {path}. Found headers: {header}"
+        )
+
+    results = {}
+    for row in data_rows:
+        if page_col >= len(row) or not str(row[page_col]).strip():
+            continue
+        url = str(row[page_col]).strip()
+        clicks = _to_number(row[clicks_col]) if clicks_col is not None and clicks_col < len(row) else 0
+        impressions = _to_number(row[impressions_col]) if impressions_col is not None and impressions_col < len(row) else 0
+        ctr = _to_ctr_fraction(row[ctr_col]) if ctr_col is not None and ctr_col < len(row) else None
+        position = _to_number(row[position_col]) if position_col is not None and position_col < len(row) else None
+        results[url] = {
+            "clicks": int(clicks or 0),
+            "impressions": int(impressions or 0),
+            "ctr": ctr,
+            "avg_position": position,
+            "top_query": "",
+        }
+    return results
+
+
 def fetch_ga4_data(credentials, property_id, days):
     from google.analytics.data_v1beta import BetaAnalyticsDataClient
     from google.analytics.data_v1beta.types import DateRange, Dimension, Metric, RunReportRequest
@@ -1500,6 +1603,11 @@ def parse_args(argv=None):
     ap.add_argument("--gsc-site-url", default=None,
                      help="Verified Search Console property, e.g. https://www.passot.co.jp/ or "
                           "sc-domain:passot.co.jp")
+    ap.add_argument("--gsc-import", default=None,
+                     help="Path to a Search Console Performance report exported manually (CSV or "
+                          "XLSX, 'Pages' tab) — an alternative to --gsc-site-url for accounts without "
+                          "Search Console admin access. Works standalone or alongside --search-data "
+                          "--ga4-property-id. Doesn't require Google credentials or --search-data.")
     ap.add_argument("--ga4-property-id", default=None,
                      help="GA4 numeric Property ID (Admin > Property Settings)")
     ap.add_argument("--google-credentials-file", default=None,
@@ -1583,14 +1691,17 @@ def main(argv=None):
     google_credentials = None
     if args.search_data:
         if not args.gsc_site_url and not args.ga4_property_id:
-            print("ERROR: --search-data requires at least one of --gsc-site-url or --ga4-property-id.",
-                  file=sys.stderr)
+            print("ERROR: --search-data requires at least one of --gsc-site-url or --ga4-property-id "
+                  "(or use --gsc-import for Search Console data without API access).", file=sys.stderr)
             return 1
-        try:
-            google_credentials = get_google_credentials(args.google_credentials_file, GOOGLE_SCOPES)
-        except Exception as e:
-            print(f"ERROR: {e}", file=sys.stderr)
-            return 1
+        needs_api_gsc = bool(args.gsc_site_url and not args.gsc_import)
+        needs_api_ga4 = bool(args.ga4_property_id)
+        if needs_api_gsc or needs_api_ga4:
+            try:
+                google_credentials = get_google_credentials(args.google_credentials_file, GOOGLE_SCOPES)
+            except Exception as e:
+                print(f"ERROR: {e}", file=sys.stderr)
+                return 1
 
     base_netloc = normalize_netloc(urlparse(args.base_url).netloc)
 
@@ -1649,18 +1760,30 @@ def main(argv=None):
     print(f"  {len(pairs)} pairs matched, {len(unmatched_en)} EN pages and {len(unmatched_ja)} JP pages unmatched.")
 
     orphan_search_pages = []
+    gsc_data, ga4_data = {}, {}
+
+    if args.gsc_import:
+        print(f"Loading Search Console export from {args.gsc_import} ...")
+        try:
+            gsc_data = load_gsc_export(args.gsc_import)
+            print(f"  Loaded {len(gsc_data)} page rows from the export.")
+        except Exception as e:
+            print(f"WARNING: --gsc-import failed, continuing without it: {e}", file=sys.stderr)
+
     if args.search_data:
         print(f"Fetching Search Console / GA4 data (last {args.search_data_days} days) ...")
         try:
-            gsc_data = fetch_gsc_data(google_credentials, args.gsc_site_url, args.search_data_days) \
-                if args.gsc_site_url else {}
-            ga4_data = fetch_ga4_data(google_credentials, args.ga4_property_id, args.search_data_days) \
-                if args.ga4_property_id else {}
-            orphan_search_pages = attach_search_data(pages, gsc_data, ga4_data)
-            print(f"  Matched Search Console/GA4 data to "
-                  f"{sum(1 for p in pages if p.gsc_impressions is not None or p.ga4_sessions is not None)} pages.")
+            if args.gsc_site_url and not args.gsc_import:
+                gsc_data = fetch_gsc_data(google_credentials, args.gsc_site_url, args.search_data_days)
+            if args.ga4_property_id:
+                ga4_data = fetch_ga4_data(google_credentials, args.ga4_property_id, args.search_data_days)
         except Exception as e:
             print(f"WARNING: --search-data fetch failed, continuing without it: {e}", file=sys.stderr)
+
+    if gsc_data or ga4_data:
+        orphan_search_pages = attach_search_data(pages, gsc_data, ga4_data)
+        print(f"  Matched Search Console/GA4 data to "
+              f"{sum(1 for p in pages if p.gsc_impressions is not None or p.ga4_sessions is not None)} pages.")
 
     if args.skip_broken_links:
         print("Skipping broken-link check (--skip-broken-links).")
