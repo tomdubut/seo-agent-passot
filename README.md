@@ -204,8 +204,16 @@ Performance report as a file, which you can hand off and import directly:
    `.xlsx` file with one tab per dimension — this tool reads the "Pages"
    tab). CSV also works, but comes as a zip of several files, so Excel is
    simpler to hand off as one file.
-2. Send you that file. Import it with:
-   `python seo_audit.py --gsc-import "Search Console Performance.xlsx"`
+2. Get you that file, then import it — how depends on where you run the
+   audit:
+   - **Locally:** save the file anywhere on your machine and run
+     `python seo_audit.py --gsc-import "Search Console Performance.xlsx"`
+   - **Via GitHub Actions:** `workflow_dispatch` inputs can't take file
+     uploads directly, so upload the file into the repo first — open the
+     [`gsc-exports/`](gsc-exports/) folder on GitHub → **Add file** →
+     **Upload files** → drag in the export → commit. Then, when running
+     the "SEO Audit" workflow, set `gsc_import_path` to the file's path
+     (e.g. `gsc-exports/Performance.xlsx`).
 
 This works standalone (no `--search-data`, no Google credentials, nothing
 else needed) and populates the same **Search Performance (GSC)** tab and
