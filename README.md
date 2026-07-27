@@ -9,7 +9,9 @@ No accounts, API keys, or scheduling required for the core audit — it
 only reads pages that are already public on the site. Two optional modes
 add real data and do need accounts: `--ai-analysis` (an Anthropic API
 key) and `--search-data` (a Google service account with Search Console +
-GA4 access) — see below for both.
+GA4 access) — see below for both. If you don't have Search Console admin
+access, `--gsc-import` lets you import a manually-exported report instead
+of using the API — see below.
 
 ## Setup
 
@@ -48,6 +50,7 @@ Useful flags (see `python seo_audit.py --help` for the full list):
 | `--ga4-property-id ID` | Your GA4 numeric Property ID (Admin → Property Settings) |
 | `--google-credentials-file PATH` | Path to the service account JSON key. If omitted, falls back to `GOOGLE_SERVICE_ACCOUNT_JSON` or `GOOGLE_APPLICATION_CREDENTIALS` in the environment. |
 | `--search-data-days N` | Lookback window in days for Search Console/GA4 data (default: 28) |
+| `--gsc-import FILE` | Import a manually-exported Search Console Performance report (CSV or XLSX) instead of using the API — see below. No Google credentials needed, and works with or without `--search-data`. |
 
 If the site blocks the crawler (403s), it's likely a WAF/bot-protection
 rule reacting to the request pattern or User-Agent — try `--delay 2` first,
@@ -187,6 +190,36 @@ Google products):
 You can use just one of the two products (e.g. `--search-data
 --gsc-site-url ...` with no `--ga4-property-id`) if you only have access
 set up for one.
+
+### No Search Console admin access? Import the export instead (`--gsc-import`)
+
+If you don't have (or can't get) admin access to Search Console — for
+example, someone else owns the property and only gave you GA4 — you don't
+need the API or a service account for the Search Console half at all.
+Search Console lets anyone with at least "Restricted" access export the
+Performance report as a file, which you can hand off and import directly:
+
+1. Whoever has Search Console access opens **Performance** → sets the date
+   range you want → clicks **Export** → **Download Excel** (a single
+   `.xlsx` file with one tab per dimension — this tool reads the "Pages"
+   tab). CSV also works, but comes as a zip of several files, so Excel is
+   simpler to hand off as one file.
+2. Send you that file. Import it with:
+   `python seo_audit.py --gsc-import "Search Console Performance.xlsx"`
+
+This works standalone (no `--search-data`, no Google credentials, nothing
+else needed) and populates the same **Search Performance (GSC)** tab and
+Executive Summary sections as the API path. You can also combine it with
+`--search-data --ga4-property-id ...` to get GA4 via the API while GSC
+comes from the imported file — in that case `--gsc-import` takes
+precedence over `--gsc-site-url` for the Search Console data specifically,
+so you don't need Search Console API access at all.
+
+**Trade-off:** the exported report doesn't include each page's individual
+top query (Search Console only ties queries to pages in the live API
+response, not the flat export), so `--ai-analysis` keyword grounding falls
+back to `--ai-keyword-map` or its own inference for keyword matching, even
+though clicks/impressions/CTR/position are still real numbers either way.
 
 **Limitations:** Search Console data has a 2-3 day reporting lag and
 suppresses very low-volume queries for privacy, so long-tail/low-traffic
