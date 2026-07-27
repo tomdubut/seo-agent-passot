@@ -50,6 +50,11 @@ DEFAULT_THIN_CHARS_JA = 600
 # observed page sizes (even long-form articles run well under this).
 MAX_CONTENT_TEXT_CHARS = 8000
 DEFAULT_AI_MODEL = "claude-sonnet-5"
+DEFAULT_SEARCH_DATA_DAYS = 28
+GOOGLE_SCOPES = [
+    "https://www.googleapis.com/auth/webmasters.readonly",
+    "https://www.googleapis.com/auth/analytics.readonly",
+]
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 PassotSEOAudit/1.0"
@@ -103,6 +108,16 @@ class Page:
     og_tags: dict = field(default_factory=dict)
     twitter_card: bool = False
     content_text: str = ""
+    gsc_clicks: int = None
+    gsc_impressions: int = None
+    gsc_ctr: float = None
+    gsc_avg_position: float = None
+    gsc_top_query: str = ""
+    ga4_sessions: int = None
+    ga4_pageviews: int = None
+    ga4_engagement_rate: float = None
+    ga4_bounce_rate: float = None
+    ga4_conversions: float = None
 
     @property
     def ok(self):
@@ -734,11 +749,16 @@ def load_keyword_map(path):
     return keyword_map
 
 
-def analyze_page_with_ai(client, page, model, target_keyword=None):
-    if target_keyword:
+def analyze_page_with_ai(client, page, model, target_keyword=None, keyword_source=None):
+    if target_keyword and keyword_source == "user_specified":
         keyword_line = (
             f"The site owner has specified this page's target keyword/topic as: {target_keyword!r}. "
             "Judge fit against this specific target."
+        )
+    elif target_keyword and keyword_source == "search_console":
+        keyword_line = (
+            f"Google Search Console shows this page's top real search query (by impressions) is: "
+            f"{target_keyword!r}. Judge fit against this actual query people are typing — not a guess."
         )
     else:
         keyword_line = (
@@ -746,10 +766,22 @@ def analyze_page_with_ai(client, page, model, target_keyword=None):
             "its own title, headings, and content, and say so."
         )
 
+    performance_line = ""
+    if page.gsc_impressions is not None:
+        ctr_text = f"{page.gsc_ctr * 100:.1f}%" if page.gsc_ctr is not None else "n/a"
+        position_text = f"{page.gsc_avg_position:.1f}" if page.gsc_avg_position is not None else "n/a"
+        performance_line = (
+            f"\nReal Search Console performance (recent period): {page.gsc_clicks} clicks, "
+            f"{page.gsc_impressions} impressions, CTR {ctr_text}, average position {position_text}. "
+            "Factor this into your judgment — e.g. decent position with poor CTR usually points at the "
+            "title/meta description, not the content.\n"
+        )
+
     user_content = (
         f"URL: {page.url}\n"
         f"Language: {'English' if page.lang == 'en' else 'Japanese'}\n"
-        f"{keyword_line}\n\n"
+        f"{keyword_line}\n"
+        f"{performance_line}\n"
         f"Title tag ({len(page.title)} chars): {page.title!r}\n"
         f"Meta description ({len(page.meta_description)} chars): {page.meta_description!r}\n"
         f"H1: {page.h1_list}\n"
@@ -786,13 +818,155 @@ def run_ai_analysis(pages, model, keyword_map):
     results = {}
     print(f"Running AI content/keyword analysis on {len(ok_pages)} pages using {model} ...")
     for i, p in enumerate(ok_pages, 1):
-        target_keyword = keyword_map.get(p.url.rstrip("/"))
+        explicit_keyword = keyword_map.get(p.url.rstrip("/"))
+        if explicit_keyword:
+            target_keyword, keyword_source = explicit_keyword, "user_specified"
+        elif p.gsc_top_query:
+            target_keyword, keyword_source = p.gsc_top_query, "search_console"
+        else:
+            target_keyword, keyword_source = None, None
         print(f"  [{i}/{len(ok_pages)}] {p.url}")
         try:
-            results[p.url] = analyze_page_with_ai(client, p, model, target_keyword)
+            results[p.url] = analyze_page_with_ai(client, p, model, target_keyword, keyword_source)
         except Exception as e:
             print(f"    AI analysis failed: {e}", file=sys.stderr)
     return results
+
+
+# --------------------------------------------------------------------------
+# Google Search Console & GA4 integration (opt-in via --search-data)
+# --------------------------------------------------------------------------
+
+def get_google_credentials(credentials_file, scopes):
+    from google.oauth2.service_account import Credentials
+
+    if credentials_file:
+        return Credentials.from_service_account_file(credentials_file, scopes=scopes)
+
+    raw_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if raw_json:
+        return Credentials.from_service_account_info(json.loads(raw_json), scopes=scopes)
+
+    app_creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+    if app_creds_path:
+        return Credentials.from_service_account_file(app_creds_path, scopes=scopes)
+
+    raise RuntimeError(
+        "No Google credentials found. Pass --google-credentials-file, or set "
+        "GOOGLE_SERVICE_ACCOUNT_JSON (the service account JSON key content) or "
+        "GOOGLE_APPLICATION_CREDENTIALS (a path to the JSON key file) in the environment."
+    )
+
+
+def fetch_gsc_data(credentials, site_url, days):
+    import datetime
+    from googleapiclient.discovery import build
+
+    # Search Console data typically has a 2-3 day reporting lag.
+    end_date = datetime.date.today() - datetime.timedelta(days=3)
+    start_date = end_date - datetime.timedelta(days=days)
+
+    service = build("searchconsole", "v1", credentials=credentials)
+    request_body = {
+        "startDate": start_date.isoformat(),
+        "endDate": end_date.isoformat(),
+        "dimensions": ["page", "query"],
+        "rowLimit": 25000,
+    }
+    response = service.searchanalytics().query(siteUrl=site_url, body=request_body).execute()
+    rows = response.get("rows", [])
+
+    per_page = defaultdict(lambda: {"clicks": 0, "impressions": 0, "position_weighted_sum": 0.0, "queries": []})
+    for row in rows:
+        page, query = row["keys"]
+        clicks = row.get("clicks", 0)
+        impressions = row.get("impressions", 0)
+        position = row.get("position", 0.0)
+        entry = per_page[page]
+        entry["clicks"] += clicks
+        entry["impressions"] += impressions
+        entry["position_weighted_sum"] += position * impressions
+        entry["queries"].append((query, impressions))
+
+    results = {}
+    for page, entry in per_page.items():
+        impressions = entry["impressions"]
+        top_query = max(entry["queries"], key=lambda q: q[1])[0] if entry["queries"] else ""
+        results[page] = {
+            "clicks": entry["clicks"],
+            "impressions": impressions,
+            "ctr": (entry["clicks"] / impressions) if impressions else None,
+            "avg_position": (entry["position_weighted_sum"] / impressions) if impressions else None,
+            "top_query": top_query,
+        }
+    return results
+
+
+def fetch_ga4_data(credentials, property_id, days):
+    from google.analytics.data_v1beta import BetaAnalyticsDataClient
+    from google.analytics.data_v1beta.types import DateRange, Dimension, Metric, RunReportRequest
+
+    client = BetaAnalyticsDataClient(credentials=credentials)
+    request = RunReportRequest(
+        property=f"properties/{property_id}",
+        dimensions=[Dimension(name="pagePath")],
+        metrics=[
+            Metric(name="sessions"),
+            Metric(name="screenPageViews"),
+            Metric(name="engagementRate"),
+            Metric(name="bounceRate"),
+            Metric(name="conversions"),
+        ],
+        date_ranges=[DateRange(start_date=f"{days}daysAgo", end_date="today")],
+        limit=100000,
+    )
+    response = client.run_report(request)
+
+    results = {}
+    for row in response.rows:
+        path = row.dimension_values[0].value
+        sessions, pageviews, engagement_rate, bounce_rate, conversions = (v.value for v in row.metric_values)
+        results[path] = {
+            "sessions": int(float(sessions)),
+            "pageviews": int(float(pageviews)),
+            "engagement_rate": float(engagement_rate),
+            "bounce_rate": float(bounce_rate),
+            "conversions": float(conversions),
+        }
+    return results
+
+
+def attach_search_data(pages, gsc_data, ga4_data):
+    """Matches fetched GSC/GA4 rows onto crawled Page objects. Returns GSC
+    rows that had impressions but matched no crawled page — often orphan
+    pages (indexed and getting traffic, but missing from the sitemap)."""
+    gsc_by_key = {u.rstrip("/"): d for u, d in (gsc_data or {}).items()}
+    ga4_by_path = {(p.rstrip("/") or "/"): d for p, d in (ga4_data or {}).items()}
+    matched_gsc_keys = set()
+
+    for p in pages:
+        key = p.url.rstrip("/")
+        gsc = gsc_by_key.get(key)
+        if gsc:
+            matched_gsc_keys.add(key)
+            p.gsc_clicks = gsc["clicks"]
+            p.gsc_impressions = gsc["impressions"]
+            p.gsc_ctr = gsc["ctr"]
+            p.gsc_avg_position = gsc["avg_position"]
+            p.gsc_top_query = gsc["top_query"]
+
+        path_key = urlparse(p.url).path.rstrip("/") or "/"
+        ga4 = ga4_by_path.get(path_key)
+        if ga4:
+            p.ga4_sessions = ga4["sessions"]
+            p.ga4_pageviews = ga4["pageviews"]
+            p.ga4_engagement_rate = ga4["engagement_rate"]
+            p.ga4_bounce_rate = ga4["bounce_rate"]
+            p.ga4_conversions = ga4["conversions"]
+
+    orphan_gsc = [(u, d) for u, d in (gsc_data or {}).items() if u.rstrip("/") not in matched_gsc_keys]
+    orphan_gsc.sort(key=lambda kv: -kv[1]["impressions"])
+    return orphan_gsc
 
 
 # --------------------------------------------------------------------------
@@ -853,7 +1027,8 @@ def write_issues_sheet(wb, issues):
         ws.cell(row=summary_row, column=2 + i, value=f"{sev}: {counts.get(sev, 0)}")
 
 
-def write_executive_summary(wb, pages, issues, pairs, unmatched_en, unmatched_ja, recurring_alt, ai_results=None):
+def write_executive_summary(wb, pages, issues, pairs, unmatched_en, unmatched_ja, recurring_alt,
+                             ai_results=None, orphan_search_pages=None):
     ws = wb.create_sheet("Executive Summary")
     ok_pages = [p for p in pages if p.ok]
     en_count = sum(1 for p in ok_pages if p.lang == "en")
@@ -962,6 +1137,45 @@ def write_executive_summary(wb, pages, issues, pairs, unmatched_en, unmatched_ja
              "(sorted worst-rated first).")
         state["row"] += 1
 
+    has_search_data = any(p.gsc_impressions is not None or p.ga4_sessions is not None for p in pages)
+    top_traffic_pages = []
+    if has_search_data:
+        subheader("Real traffic & search performance")
+        total_clicks = sum(p.gsc_clicks or 0 for p in pages)
+        total_impressions = sum(p.gsc_impressions or 0 for p in pages)
+        total_sessions = sum(p.ga4_sessions or 0 for p in pages)
+        line(f"Site totals (recent period): {total_clicks} clicks / {total_impressions} impressions "
+             f"(Search Console), {total_sessions} sessions (GA4).")
+
+        issue_counts = defaultdict(int)
+        for i in issues:
+            issue_counts[i.url] += 1
+
+        top_traffic_pages = sorted(
+            (p for p in pages if p.ok and ((p.ga4_sessions or 0) + (p.gsc_clicks or 0)) > 0),
+            key=lambda p: -((p.ga4_sessions or 0) + (p.gsc_clicks or 0)),
+        )[:10]
+        if top_traffic_pages:
+            line("Top pages by real traffic, with open issue counts (fixing issues here matters most):")
+            table_header(["URL", "Sessions (GA4)", "Clicks (GSC)", "Open Issues"])
+            for p in top_traffic_pages:
+                ws.cell(row=state["row"], column=1, value=p.url)
+                ws.cell(row=state["row"], column=2, value=p.ga4_sessions or 0)
+                ws.cell(row=state["row"], column=3, value=p.gsc_clicks or 0)
+                ws.cell(row=state["row"], column=4, value=issue_counts.get(p.url, 0))
+                state["row"] += 1
+            state["row"] += 1
+
+        if orphan_search_pages:
+            top_orphans = orphan_search_pages[:5]
+            line(
+                f"{len(orphan_search_pages)} URL(s) get real search impressions but weren't found in the "
+                "current crawl/sitemap — possible orphan or removed pages worth checking: "
+                + truncate_join([u for u, _d in top_orphans], 5)
+            )
+        line("Full per-page data is in the Search Performance (GSC) and Traffic (GA4) tabs.")
+        state["row"] += 1
+
     subheader("Fix-first priority list")
     high_cats = sorted(c for c, s in counts_by_cat.items() if HIGH in s)
     med_cats = sorted(c for c, s in counts_by_cat.items() if MEDIUM in s and HIGH not in s)
@@ -985,6 +1199,17 @@ def write_executive_summary(wb, pages, issues, pairs, unmatched_en, unmatched_ja
         urgent_count = sum(1 for r in ai_results.values() if r.overall_rating in ("Critical", "Poor"))
         if urgent_count:
             priorities.append(f"Review the {urgent_count} page(s) the AI rated 'Poor' or 'Critical' overall first.")
+    if top_traffic_pages:
+        issue_counts_for_priority = defaultdict(int)
+        for i in issues:
+            issue_counts_for_priority[i.url] += 1
+        flagged_top_traffic = sum(1 for p in top_traffic_pages if issue_counts_for_priority.get(p.url, 0) > 0)
+        if flagged_top_traffic:
+            verb = "has" if flagged_top_traffic == 1 else "have"
+            priorities.append(
+                f"{flagged_top_traffic} of your top 10 highest-traffic pages {verb} open issues — "
+                "fixing those matters more than the same fix on a low-traffic page (see the table above)."
+            )
     if not priorities:
         priorities.append("No High or Medium severity issues found. Review Low/Info items opportunistically.")
     for idx, text in enumerate(priorities, 1):
@@ -1000,13 +1225,15 @@ def write_executive_summary(wb, pages, issues, pairs, unmatched_en, unmatched_ja
 
 
 def build_workbook(pages, issues, pairs, unmatched_en, unmatched_ja, broken_links, link_sources,
-                    thin_words, thin_chars, en_prefix=DEFAULT_EN_PREFIX, ai_results=None):
+                    thin_words, thin_chars, en_prefix=DEFAULT_EN_PREFIX, ai_results=None,
+                    orphan_search_pages=None):
     wb = Workbook()
     wb.remove(wb.active)
 
     write_issues_sheet(wb, issues)
     recurring_alt = find_recurring_missing_alt(pages)
-    write_executive_summary(wb, pages, issues, pairs, unmatched_en, unmatched_ja, recurring_alt, ai_results)
+    write_executive_summary(wb, pages, issues, pairs, unmatched_en, unmatched_ja, recurring_alt,
+                             ai_results, orphan_search_pages)
 
     # All Pages
     page_types = classify_page_types(pages, pairs, en_prefix, thin_words, thin_chars)
@@ -1153,7 +1380,44 @@ def build_workbook(pages, issues, pairs, unmatched_en, unmatched_ja, broken_link
     if ai_results:
         write_ai_analysis_sheet(wb, pages, ai_results)
 
+    if any(p.gsc_impressions is not None for p in pages):
+        write_search_performance_sheet(wb, pages)
+    if any(p.ga4_sessions is not None for p in pages):
+        write_traffic_sheet(wb, pages)
+
     return wb
+
+
+def write_search_performance_sheet(wb, pages):
+    rows = []
+    for p in sorted(pages, key=lambda x: -(x.gsc_clicks or 0)):
+        if not p.ok or p.gsc_impressions is None:
+            continue
+        rows.append([
+            p.url, p.lang, p.gsc_clicks, p.gsc_impressions,
+            round(p.gsc_ctr * 100, 2) if p.gsc_ctr is not None else "",
+            round(p.gsc_avg_position, 1) if p.gsc_avg_position is not None else "",
+            p.gsc_top_query,
+        ])
+    write_sheet(wb, "Search Performance (GSC)", [
+        "URL", "Language", "Clicks", "Impressions", "CTR (%)", "Avg Position", "Top Query",
+    ], rows, col_widths=[45, 6, 10, 12, 10, 12, 35])
+
+
+def write_traffic_sheet(wb, pages):
+    rows = []
+    for p in sorted(pages, key=lambda x: -(x.ga4_sessions or 0)):
+        if not p.ok or p.ga4_sessions is None:
+            continue
+        rows.append([
+            p.url, p.lang, p.ga4_sessions, p.ga4_pageviews,
+            round(p.ga4_engagement_rate * 100, 1) if p.ga4_engagement_rate is not None else "",
+            round(p.ga4_bounce_rate * 100, 1) if p.ga4_bounce_rate is not None else "",
+            p.ga4_conversions,
+        ])
+    write_sheet(wb, "Traffic (GA4)", [
+        "URL", "Language", "Sessions", "Pageviews", "Engagement Rate (%)", "Bounce Rate (%)", "Conversions",
+    ], rows, col_widths=[45, 6, 10, 10, 18, 14, 12])
 
 
 RATING_FILL = {
@@ -1229,6 +1493,20 @@ def parse_args(argv=None):
     ap.add_argument("--ai-keyword-map", default=None,
                      help="Optional CSV file with 'url' and 'keyword' columns giving explicit target "
                           "keywords for specific pages; pages not listed fall back to AI-inferred topic")
+    ap.add_argument("--search-data", action="store_true",
+                     help="Pull real per-page data from Search Console and/or GA4 (needs a Google "
+                          "service account — see README). Also grounds --ai-analysis in real search "
+                          "queries and performance instead of inferring.")
+    ap.add_argument("--gsc-site-url", default=None,
+                     help="Verified Search Console property, e.g. https://www.passot.co.jp/ or "
+                          "sc-domain:passot.co.jp")
+    ap.add_argument("--ga4-property-id", default=None,
+                     help="GA4 numeric Property ID (Admin > Property Settings)")
+    ap.add_argument("--google-credentials-file", default=None,
+                     help="Path to the Google service account JSON key file. If omitted, falls back to "
+                          "the GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_APPLICATION_CREDENTIALS env vars.")
+    ap.add_argument("--search-data-days", type=int, default=DEFAULT_SEARCH_DATA_DAYS,
+                     help=f"Lookback window in days for Search Console/GA4 data (default: {DEFAULT_SEARCH_DATA_DAYS})")
     return ap.parse_args(argv)
 
 
@@ -1302,6 +1580,18 @@ def main(argv=None):
               "in the environment.", file=sys.stderr)
         return 1
 
+    google_credentials = None
+    if args.search_data:
+        if not args.gsc_site_url and not args.ga4_property_id:
+            print("ERROR: --search-data requires at least one of --gsc-site-url or --ga4-property-id.",
+                  file=sys.stderr)
+            return 1
+        try:
+            google_credentials = get_google_credentials(args.google_credentials_file, GOOGLE_SCOPES)
+        except Exception as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 1
+
     base_netloc = normalize_netloc(urlparse(args.base_url).netloc)
 
     session = requests.Session()
@@ -1358,6 +1648,20 @@ def main(argv=None):
     pairs, unmatched_en, unmatched_ja = pair_pages(pages, args.en_prefix)
     print(f"  {len(pairs)} pairs matched, {len(unmatched_en)} EN pages and {len(unmatched_ja)} JP pages unmatched.")
 
+    orphan_search_pages = []
+    if args.search_data:
+        print(f"Fetching Search Console / GA4 data (last {args.search_data_days} days) ...")
+        try:
+            gsc_data = fetch_gsc_data(google_credentials, args.gsc_site_url, args.search_data_days) \
+                if args.gsc_site_url else {}
+            ga4_data = fetch_ga4_data(google_credentials, args.ga4_property_id, args.search_data_days) \
+                if args.ga4_property_id else {}
+            orphan_search_pages = attach_search_data(pages, gsc_data, ga4_data)
+            print(f"  Matched Search Console/GA4 data to "
+                  f"{sum(1 for p in pages if p.gsc_impressions is not None or p.ga4_sessions is not None)} pages.")
+        except Exception as e:
+            print(f"WARNING: --search-data fetch failed, continuing without it: {e}", file=sys.stderr)
+
     if args.skip_broken_links:
         print("Skipping broken-link check (--skip-broken-links).")
     else:
@@ -1375,7 +1679,7 @@ def main(argv=None):
 
     print("Writing workbook ...")
     wb = build_workbook(pages, issues, pairs, unmatched_en, unmatched_ja, broken_links, link_sources,
-                         args.thin_words, args.thin_chars, args.en_prefix, ai_results)
+                         args.thin_words, args.thin_chars, args.en_prefix, ai_results, orphan_search_pages)
     wb.save(args.output)
 
     counts = defaultdict(int)

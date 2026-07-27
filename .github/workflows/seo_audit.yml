@@ -17,6 +17,19 @@ on:
         required: false
         default: false
         type: boolean
+      search_data:
+        description: "Also pull real Search Console + GA4 data per page (needs the GOOGLE_SERVICE_ACCOUNT_JSON repo secret and the fields below)"
+        required: false
+        default: false
+        type: boolean
+      gsc_site_url:
+        description: "Verified Search Console property (only used if search_data is checked)"
+        required: false
+        default: "https://www.passot.co.jp/"
+      ga4_property_id:
+        description: "GA4 numeric Property ID (only used if search_data is checked)"
+        required: false
+        default: ""
 
 jobs:
   audit:
@@ -35,6 +48,7 @@ jobs:
       - name: Run SEO audit
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
         run: |
           ARGS=()
           if [ -n "${{ github.event.inputs.max_pages }}" ]; then
@@ -45,6 +59,15 @@ jobs:
           fi
           if [ "${{ github.event.inputs.ai_analysis }}" = "true" ]; then
             ARGS+=(--ai-analysis)
+          fi
+          if [ "${{ github.event.inputs.search_data }}" = "true" ]; then
+            ARGS+=(--search-data)
+            if [ -n "${{ github.event.inputs.gsc_site_url }}" ]; then
+              ARGS+=(--gsc-site-url "${{ github.event.inputs.gsc_site_url }}")
+            fi
+            if [ -n "${{ github.event.inputs.ga4_property_id }}" ]; then
+              ARGS+=(--ga4-property-id "${{ github.event.inputs.ga4_property_id }}")
+            fi
           fi
           python seo_audit.py --output passot_seo_audit.xlsx "${ARGS[@]}"
 
