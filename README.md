@@ -152,8 +152,9 @@ Google products):
 1. In [Google Cloud Console](https://console.cloud.google.com/), create or
    pick a project, then enable two APIs for it: **Search Console API** and
    **Google Analytics Data API** (APIs & Services → Library → search for
-   each → Enable). The project needs billing enabled, though normal usage
-   here stays within the free quota.
+   each → Enable). Both are free — neither requires a billing account on
+   the project, and this tool's usage (a handful of report queries per
+   run) is nowhere near either API's free quota regardless.
 2. Create a **service account** (IAM & Admin → Service Accounts → Create
    Service Account) — this is a "robot" identity, separate from your own
    Google login, used for unattended access. Give it any name (e.g.
