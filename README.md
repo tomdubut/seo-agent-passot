@@ -45,12 +45,15 @@ Useful flags (see `python seo_audit.py --help` for the full list):
 | `--ai-analysis` | Also run an AI (Claude) review of keyword fit, meta quality, and content quality per page — see below. Requires `ANTHROPIC_API_KEY` in the environment. |
 | `--ai-model MODEL` | Model to use for `--ai-analysis` (default: `claude-sonnet-5`) |
 | `--ai-keyword-map FILE.csv` | CSV with `url,keyword` columns giving explicit target keywords for specific pages — see below |
+| `--ai-pages TEXT` | Restrict `--ai-analysis` (the paid step) to these pages only — comma/newline-separated URLs or paths — see below. No effect without `--ai-analysis`. |
+| `--ai-pages-file FILE` | Same as `--ai-pages`, but from a text file (one URL/path per line) — see below |
 | `--search-data` | Pull real per-page Search Console + GA4 data — see below. Needs a Google service account. |
 | `--gsc-site-url URL` | Your verified Search Console property, e.g. `https://www.passot.co.jp/` or `sc-domain:passot.co.jp` |
 | `--ga4-property-id ID` | Your GA4 numeric Property ID (Admin → Property Settings) |
 | `--google-credentials-file PATH` | Path to the service account JSON key. If omitted, falls back to `GOOGLE_SERVICE_ACCOUNT_JSON` or `GOOGLE_APPLICATION_CREDENTIALS` in the environment. |
 | `--search-data-days N` | Lookback window in days for Search Console/GA4 data (default: 28) |
 | `--gsc-import FILE` | Import a manually-exported Search Console Performance report (CSV or XLSX) instead of using the API — see below. No Google credentials needed, and works with or without `--search-data`. |
+| `--gsc-links-import FILE [FILE ...]` | Import one to three Search Console "Links" report exports (external backlinks) — see below. File type auto-detected per file. |
 
 If the site blocks the crawler (403s), it's likely a WAF/bot-protection
 rule reacting to the request pattern or User-Agent — try `--delay 2` first,
@@ -113,6 +116,22 @@ actually type.
 (Sonnet 5 is the default and lands around $0.40) — small, but not free
 like the rest of the tool, and it's a real network call each time you run
 it, so it's opt-in rather than bundled into every run.
+
+**Only reviewing specific pages (`--ai-pages` / `--ai-pages-file`):**
+`--max-pages` limits how many pages get *crawled* (still the first N in
+sitemap order, so it's not useful for targeting), but the AI review has
+its own, more precise selector that leaves the full-site crawl and every
+free technical check untouched — only the paid step is restricted:
+- `--ai-pages "https://www.passot.co.jp/en/about/, /products/2byo/"` —
+  comma and/or newline separated full URLs or paths, pasted inline.
+- `--ai-pages-file pages.txt` — a text file, one URL or path per line
+  (`#` comments and blank lines ignored), for a longer or reusable list.
+
+Both are no-ops without `--ai-analysis` (they don't turn it on by
+themselves), and you can combine them. Via GitHub Actions, use the
+`ai_pages` field for a short comma-separated list, or upload a text file
+anywhere in the repo (**Add file → Upload files** on GitHub, same as the
+`gsc-exports/` flow below) and point `ai_pages_file` at its path.
 
 **Target keywords:** by default the AI infers each page's apparent target
 topic from its own content — useful for a general quality read, but it's
@@ -236,6 +255,43 @@ actually installed — if it's new, the lookback window won't have much
 history. Neither source is fabricated or estimated; if a page has no data,
 it's shown as blank rather than guessed at.
 
+## External links / backlinks (optional, `--gsc-links-import`)
+
+This tool deliberately does **not** estimate domain authority, backlink
+"quality" scores, or any other invented ranking-strength number — there's
+no reliable source for that without relying on a third-party SEO
+vendor's own black-box estimate, and this project would rather show
+nothing than show a number it can't stand behind.
+
+What it *can* do is show you Search Console's own real data about who
+links to you. That's a separate report — **Links** in the Search Console
+sidebar — with no API (export-only, like Performance), so it works the
+same way as `--gsc-import` above:
+
+1. Whoever has Search Console access opens **Links** → under **External
+   links**, exports each table you want: **Top linked pages**, **Top
+   linking sites**, and/or **Top linking text**. You don't need all
+   three — import whichever you have.
+2. Import them (auto-detected from each file's own header row, so the
+   order doesn't matter):
+   `python seo_audit.py --gsc-links-import "Top pages.csv" "Top sites.csv"`
+   Via GitHub Actions: upload the file(s) into `gsc-exports/` the same
+   way as the Performance export, then set `gsc_links_import_paths` to
+   their paths (space or comma separated, up to 3).
+
+This adds up to three tabs: **External Links - Pages (GSC)** (how many
+external sites link to each of your pages), **External Linking Sites
+(GSC)** (which domains link to you most), and **External Linking Text
+(GSC)** (the anchor text used). Raw counts only, straight from Google —
+no scoring or interpretation layered on top.
+
+**Note:** this is newer than the rest of the tool's Google-data features
+and hasn't yet been run against a real Search Console Links export in
+this environment — if the column headers on your export don't match
+what it expects, it'll fail with a clear error showing what it found
+rather than silently misreading the file; if that happens, share the
+error and it can be adjusted.
+
 ## What it checks
 
 - **Per page:** title tag, meta description, canonical tag, H1/H2
@@ -309,11 +365,13 @@ content ideas. The translation-parity, weak-internal-linking, and (with
   to see exactly which container was used and why, and whether the real
   text exists elsewhere in the raw HTML (a selection issue) or genuinely
   isn't there as crawlable text (e.g. content delivered as images).
-- **No indexing/ranking/traffic data** — that requires Google Search
-  Console, which isn't wired up here.
 - **No page speed / Core Web Vitals** — requires PageSpeed Insights API,
   not included.
-- **No backlink data** — intentionally excluded; not built, not estimated.
+- **No invented backlink/authority scores** — `--gsc-links-import` (see
+  above) shows Search Console's own real external-links data when you
+  import it, but there's still no domain-authority-style estimate; that
+  would mean relying on a third-party vendor's black-box number, which
+  this tool won't fabricate or approximate.
 - **No soft-404 detection** — a page returning HTTP 200 with an empty or
   "not found"-looking template will read as healthy; only real HTTP status
   codes are checked.
