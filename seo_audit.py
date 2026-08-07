@@ -118,6 +118,7 @@ class Page:
     ga4_engagement_rate: float = None
     ga4_bounce_rate: float = None
     ga4_conversions: float = None
+    external_backlinks: int = None
 
     @property
     def ok(self):
@@ -749,6 +750,75 @@ def load_keyword_map(path):
     return keyword_map
 
 
+def parse_page_selectors(inline_text, file_path):
+    """Combines --ai-pages (comma/newline separated) and --ai-pages-file
+    (one entry per line, '#'-comments and blank lines ignored) into a single
+    deduplicated list of raw entry strings (full URLs or bare paths). A bad
+    file path raises — callers must not treat that as "no selection" and
+    silently fall back to an unrestricted (full-cost) AI run."""
+    entries = []
+    if inline_text:
+        for chunk in re.split(r"[,\n]", inline_text):
+            chunk = chunk.strip()
+            if chunk:
+                entries.append(chunk)
+    if file_path:
+        with open(file_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    entries.append(line)
+    seen = set()
+    deduped = []
+    for e in entries:
+        if e not in seen:
+            seen.add(e)
+            deduped.append(e)
+    return deduped
+
+
+def _selector_keys(value):
+    """Normalizes a URL or bare path to (full_url_key, path_key), stripping
+    query/fragment so pasted tracking params don't break matching."""
+    if not value.startswith(("http://", "https://")):
+        value = "/" + value.lstrip("/")
+    parsed = urlparse(value)
+    path_key = parsed.path.rstrip("/") or "/"
+    if parsed.scheme:
+        full_key = f"{parsed.scheme}://{parsed.netloc}{path_key}"
+    else:
+        full_key = None
+    return full_key, path_key
+
+
+def match_page_selectors(pages, entries):
+    """Matches raw --ai-pages/--ai-pages-file entries (full URLs or bare
+    paths) against crawled Page objects. Returns (matched_urls: set of
+    canonical p.url values, unmatched_entries: list of entries that matched
+    no page)."""
+    by_full = {}
+    by_path = defaultdict(list)
+    for p in pages:
+        full_key, path_key = _selector_keys(p.url)
+        by_full[full_key] = p.url
+        by_path[path_key].append(p.url)
+
+    matched = set()
+    unmatched = []
+    for entry in entries:
+        full_key, path_key = _selector_keys(entry)
+        found = []
+        if full_key and full_key in by_full:
+            found = [by_full[full_key]]
+        elif path_key in by_path:
+            found = by_path[path_key]
+        if found:
+            matched.update(found)
+        else:
+            unmatched.append(entry)
+    return matched, unmatched
+
+
 def analyze_page_with_ai(client, page, model, target_keyword=None, keyword_source=None):
     if target_keyword and keyword_source == "user_specified":
         keyword_line = (
@@ -810,11 +880,16 @@ def analyze_page_with_ai(client, page, model, target_keyword=None, keyword_sourc
     return response.parsed_output
 
 
-def run_ai_analysis(pages, model, keyword_map):
+def run_ai_analysis(pages, model, keyword_map, selected_urls=None):
     import anthropic
 
     client = anthropic.Anthropic()
     ok_pages = [p for p in pages if p.ok]
+    if selected_urls is not None:
+        total_ok = len(ok_pages)
+        ok_pages = [p for p in ok_pages if p.url in selected_urls]
+        print(f"Restricting AI analysis to {len(ok_pages)} of {total_ok} eligible page(s) "
+              f"via --ai-pages/--ai-pages-file.")
     results = {}
     print(f"Running AI content/keyword analysis on {len(ok_pages)} pages using {model} ...")
     for i, p in enumerate(ok_pages, 1):
@@ -1005,6 +1080,86 @@ def load_gsc_export(path):
     return results
 
 
+def _classify_gsc_links_header(header):
+    """Identifies which of Search Console's three "Links" report exports a
+    file is (Top linked pages / Top linking sites / Top linking text) from
+    its header row, since each is exported as its own file with its own
+    column names. Checked most-distinctive-first: a domain/site column is
+    unambiguous, an anchor-text column is next, and a page/URL column is
+    checked last since URL-shaped values could incidentally appear
+    elsewhere. Raises with the header dumped if nothing (or ambiguously
+    more than one candidate signal) matches, rather than guessing."""
+    site_col = _find_col(header, "linking site", "referring site", "referring domain", "site", "domain")
+    text_col = _find_col(header, "linking text", "anchor text", "link text", "text")
+    page_col = _find_col(header, "target page", "linked page", "top pages", "page", "url")
+
+    if site_col is not None:
+        return "sites"
+    if text_col is not None:
+        return "text"
+    if page_col is not None:
+        return "pages"
+    raise ValueError(
+        f"Could not classify this file as a Search Console Links export "
+        f"(no site/domain, anchor-text, or page/URL column found). Found headers: {header}"
+    )
+
+
+def load_gsc_links_export(path):
+    """Loads one file from Search Console's "Links" report (External links:
+    Top linked pages / Top linking sites / Top linking text), auto-detecting
+    which table it is from its header row. Returns (table_type, data):
+    table_type is 'pages' | 'sites' | 'text'; data is a {url: count} dict
+    for 'pages', or a [(name, count), ...] list for 'sites'/'text'."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".xlsx", ".xlsm"):
+        rows = _read_gsc_export_xlsx(path)
+    elif ext == ".csv":
+        rows = _read_gsc_export_csv(path)
+    else:
+        raise ValueError(f"Unsupported file type for --gsc-links-import: '{ext}' (use .csv or .xlsx)")
+
+    rows = [r for r in rows if any(str(c).strip() for c in r)]
+    if not rows:
+        raise ValueError(f"No rows found in {path}")
+
+    header, data_rows = rows[0], rows[1:]
+    table_type = _classify_gsc_links_header(header)
+
+    if table_type == "pages":
+        name_col = _find_col(header, "target page", "linked page", "top pages", "page", "url")
+    elif table_type == "sites":
+        name_col = _find_col(header, "linking site", "referring site", "referring domain", "site", "domain")
+    else:
+        name_col = _find_col(header, "linking text", "anchor text", "link text", "text")
+    count_col = _find_col(header, "linking pages", "external links", "links", "count")
+
+    if name_col is None or count_col is None:
+        raise ValueError(
+            f"Could not find the name/count columns in {path} (classified as '{table_type}'). "
+            f"Found headers: {header}"
+        )
+
+    if table_type == "pages":
+        results = {}
+        for row in data_rows:
+            if name_col >= len(row) or not str(row[name_col]).strip():
+                continue
+            name = str(row[name_col]).strip()
+            count = _to_number(row[count_col]) if count_col < len(row) else 0
+            results[name] = int(count or 0)
+        return table_type, results
+
+    results = []
+    for row in data_rows:
+        if name_col >= len(row) or not str(row[name_col]).strip():
+            continue
+        name = str(row[name_col]).strip()
+        count = _to_number(row[count_col]) if count_col < len(row) else 0
+        results.append((name, int(count or 0)))
+    return table_type, results
+
+
 def fetch_ga4_data(credentials, property_id, days):
     from google.analytics.data_v1beta import BetaAnalyticsDataClient
     from google.analytics.data_v1beta.types import DateRange, Dimension, Metric, RunReportRequest
@@ -1070,6 +1225,21 @@ def attach_search_data(pages, gsc_data, ga4_data):
     orphan_gsc = [(u, d) for u, d in (gsc_data or {}).items() if u.rstrip("/") not in matched_gsc_keys]
     orphan_gsc.sort(key=lambda kv: -kv[1]["impressions"])
     return orphan_gsc
+
+
+def attach_gsc_external_links(pages, top_linked_pages):
+    """Matches a Search Console "Top linked pages" export onto crawled Page
+    objects (same p.url.rstrip('/') matching convention as
+    attach_search_data). Returns (url, count) pairs that matched no crawled
+    page."""
+    by_key = {u.rstrip("/"): count for u, count in (top_linked_pages or {}).items()}
+    matched_keys = set()
+    for p in pages:
+        key = p.url.rstrip("/")
+        if key in by_key:
+            p.external_backlinks = by_key[key]
+            matched_keys.add(key)
+    return [(u, count) for u, count in (top_linked_pages or {}).items() if u.rstrip("/") not in matched_keys]
 
 
 # --------------------------------------------------------------------------
@@ -1329,7 +1499,7 @@ def write_executive_summary(wb, pages, issues, pairs, unmatched_en, unmatched_ja
 
 def build_workbook(pages, issues, pairs, unmatched_en, unmatched_ja, broken_links, link_sources,
                     thin_words, thin_chars, en_prefix=DEFAULT_EN_PREFIX, ai_results=None,
-                    orphan_search_pages=None):
+                    orphan_search_pages=None, gsc_linking_sites=None, gsc_linking_text=None):
     wb = Workbook()
     wb.remove(wb.active)
 
@@ -1487,6 +1657,12 @@ def build_workbook(pages, issues, pairs, unmatched_en, unmatched_ja, broken_link
         write_search_performance_sheet(wb, pages)
     if any(p.ga4_sessions is not None for p in pages):
         write_traffic_sheet(wb, pages)
+    if any(p.external_backlinks is not None for p in pages):
+        write_external_link_pages_sheet(wb, pages)
+    if gsc_linking_sites:
+        write_external_linking_sites_sheet(wb, gsc_linking_sites)
+    if gsc_linking_text:
+        write_external_linking_text_sheet(wb, gsc_linking_text)
 
     return wb
 
@@ -1521,6 +1697,31 @@ def write_traffic_sheet(wb, pages):
     write_sheet(wb, "Traffic (GA4)", [
         "URL", "Language", "Sessions", "Pageviews", "Engagement Rate (%)", "Bounce Rate (%)", "Conversions",
     ], rows, col_widths=[45, 6, 10, 10, 18, 14, 12])
+
+
+def write_external_link_pages_sheet(wb, pages):
+    rows = []
+    for p in sorted(pages, key=lambda x: -(x.external_backlinks or 0)):
+        if not p.ok or p.external_backlinks is None:
+            continue
+        rows.append([p.url, p.lang, p.external_backlinks])
+    write_sheet(wb, "External Links - Pages (GSC)", [
+        "URL", "Language", "External Backlinks (GSC)",
+    ], rows, col_widths=[45, 6, 20])
+
+
+def write_external_linking_sites_sheet(wb, gsc_linking_sites):
+    rows = sorted(gsc_linking_sites, key=lambda kv: -kv[1])
+    write_sheet(wb, "External Linking Sites (GSC)", [
+        "Referring Domain", "Linking Pages",
+    ], rows, col_widths=[50, 16])
+
+
+def write_external_linking_text_sheet(wb, gsc_linking_text):
+    rows = sorted(gsc_linking_text, key=lambda kv: -kv[1])
+    write_sheet(wb, "External Linking Text (GSC)", [
+        "Anchor Text", "Linking Pages",
+    ], rows, col_widths=[50, 16])
 
 
 RATING_FILL = {
@@ -1596,6 +1797,13 @@ def parse_args(argv=None):
     ap.add_argument("--ai-keyword-map", default=None,
                      help="Optional CSV file with 'url' and 'keyword' columns giving explicit target "
                           "keywords for specific pages; pages not listed fall back to AI-inferred topic")
+    ap.add_argument("--ai-pages", default=None,
+                     help="Restrict --ai-analysis (the paid step) to these pages only — comma and/or "
+                          "newline separated full URLs or paths. No effect without --ai-analysis. "
+                          "Union with --ai-pages-file if both are given.")
+    ap.add_argument("--ai-pages-file", default=None,
+                     help="Text file, one URL or path per line ('#'-comments and blank lines ignored), "
+                          "restricting --ai-analysis to those pages. Union with --ai-pages.")
     ap.add_argument("--search-data", action="store_true",
                      help="Pull real per-page data from Search Console and/or GA4 (needs a Google "
                           "service account — see README). Also grounds --ai-analysis in real search "
@@ -1615,6 +1823,11 @@ def parse_args(argv=None):
                           "the GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_APPLICATION_CREDENTIALS env vars.")
     ap.add_argument("--search-data-days", type=int, default=DEFAULT_SEARCH_DATA_DAYS,
                      help=f"Lookback window in days for Search Console/GA4 data (default: {DEFAULT_SEARCH_DATA_DAYS})")
+    ap.add_argument("--gsc-links-import", nargs="+", default=None, metavar="FILE",
+                     help="One to three Search Console 'Links' report exports (Top linked pages / "
+                          "Top linking sites / Top linking text) — file type auto-detected from the "
+                          "header row. CSV or XLSX. Independent of --gsc-import/--search-data. "
+                          "Reports raw counts only, no authority/quality score is invented.")
     return ap.parse_args(argv)
 
 
@@ -1687,6 +1900,10 @@ def main(argv=None):
         print("ERROR: --ai-analysis requires ANTHROPIC_API_KEY (or ANTHROPIC_AUTH_TOKEN) to be set "
               "in the environment.", file=sys.stderr)
         return 1
+
+    if (args.ai_pages or args.ai_pages_file) and not args.ai_analysis:
+        print("WARNING: --ai-pages/--ai-pages-file has no effect without --ai-analysis.",
+              file=sys.stderr)
 
     google_credentials = None
     if args.search_data:
@@ -1785,6 +2002,37 @@ def main(argv=None):
         print(f"  Matched Search Console/GA4 data to "
               f"{sum(1 for p in pages if p.gsc_impressions is not None or p.ga4_sessions is not None)} pages.")
 
+    gsc_linking_sites, gsc_linking_text = None, None
+    if args.gsc_links_import:
+        print(f"Loading Search Console Links report export(s): {args.gsc_links_import} ...")
+        top_linked_pages = {}
+        for path in args.gsc_links_import:
+            try:
+                table_type, data = load_gsc_links_export(path)
+            except Exception as e:
+                print(f"WARNING: could not classify/load {path}, skipping: {e}", file=sys.stderr)
+                continue
+            print(f"  {path} -> classified as '{table_type}' ({len(data)} rows).")
+            if table_type == "pages":
+                top_linked_pages.update(data)
+            elif table_type == "sites":
+                if gsc_linking_sites is not None:
+                    print(f"WARNING: multiple files classified as 'sites' — {path} overwrites "
+                          f"the previous one.", file=sys.stderr)
+                gsc_linking_sites = data
+            elif table_type == "text":
+                if gsc_linking_text is not None:
+                    print(f"WARNING: multiple files classified as 'text' — {path} overwrites "
+                          f"the previous one.", file=sys.stderr)
+                gsc_linking_text = data
+        if top_linked_pages:
+            unmatched_links = attach_gsc_external_links(pages, top_linked_pages)
+            print(f"  Matched external-link counts to "
+                  f"{sum(1 for p in pages if p.external_backlinks is not None)} pages.")
+            if unmatched_links:
+                print(f"  {len(unmatched_links)} linked-page URL(s) from the export didn't match "
+                      f"a crawled page.", file=sys.stderr)
+
     if args.skip_broken_links:
         print("Skipping broken-link check (--skip-broken-links).")
     else:
@@ -1798,11 +2046,32 @@ def main(argv=None):
     ai_results = None
     if args.ai_analysis:
         keyword_map = load_keyword_map(args.ai_keyword_map) if args.ai_keyword_map else {}
-        ai_results = run_ai_analysis(pages, args.ai_model, keyword_map)
+
+        selected_urls = None
+        try:
+            selector_entries = parse_page_selectors(args.ai_pages, args.ai_pages_file)
+        except Exception as e:
+            # A bad --ai-pages-file must hard-fail rather than silently
+            # falling back to an unrestricted (full-cost) AI run.
+            print(f"ERROR: could not read --ai-pages-file: {e}", file=sys.stderr)
+            return 1
+        if selector_entries:
+            selected_urls, unmatched = match_page_selectors(pages, selector_entries)
+            if unmatched:
+                print(f"WARNING: {len(unmatched)} --ai-pages/--ai-pages-file entry(ies) matched no "
+                      f"crawled page: {unmatched}", file=sys.stderr)
+            excluded_not_ok = sorted(u for u in selected_urls
+                                      if not next(p for p in pages if p.url == u).ok)
+            if excluded_not_ok:
+                print(f"WARNING: {len(excluded_not_ok)} selected page(s) didn't crawl successfully "
+                      f"and will be excluded from AI analysis: {excluded_not_ok}", file=sys.stderr)
+
+        ai_results = run_ai_analysis(pages, args.ai_model, keyword_map, selected_urls)
 
     print("Writing workbook ...")
     wb = build_workbook(pages, issues, pairs, unmatched_en, unmatched_ja, broken_links, link_sources,
-                         args.thin_words, args.thin_chars, args.en_prefix, ai_results, orphan_search_pages)
+                         args.thin_words, args.thin_chars, args.en_prefix, ai_results, orphan_search_pages,
+                         gsc_linking_sites, gsc_linking_text)
     wb.save(args.output)
 
     counts = defaultdict(int)

@@ -17,6 +17,14 @@ on:
         required: false
         default: false
         type: boolean
+      ai_pages:
+        description: "Restrict AI analysis to these pages only, comma-separated full URLs or paths (only used if ai_analysis is checked; leave blank to analyze every crawled page)"
+        required: false
+        default: ""
+      ai_pages_file:
+        description: "Path in this repo to a text file (one URL/path per line) restricting AI analysis to those pages — upload via GitHub's web UI first (only used if ai_analysis is checked)"
+        required: false
+        default: ""
       search_data:
         description: "Also pull real Search Console + GA4 data per page (needs the GOOGLE_SERVICE_ACCOUNT_JSON repo secret and the fields below)"
         required: false
@@ -32,6 +40,10 @@ on:
         default: ""
       gsc_import_path:
         description: "Path in this repo to a Search Console export file to import (e.g. gsc-exports/performance.xlsx) — upload it via GitHub's web UI first. Alternative to gsc_site_url when you don't have Search Console admin access."
+        required: false
+        default: ""
+      gsc_links_import_paths:
+        description: "Path(s) in this repo to Search Console 'Links' report export(s) (Top linked pages / Top linking sites / Top linking text), space or comma separated (up to 3) — upload via GitHub's web UI first"
         required: false
         default: ""
 
@@ -63,6 +75,12 @@ jobs:
           fi
           if [ "${{ github.event.inputs.ai_analysis }}" = "true" ]; then
             ARGS+=(--ai-analysis)
+            if [ -n "${{ github.event.inputs.ai_pages }}" ]; then
+              ARGS+=(--ai-pages "${{ github.event.inputs.ai_pages }}")
+            fi
+            if [ -n "${{ github.event.inputs.ai_pages_file }}" ]; then
+              ARGS+=(--ai-pages-file "${{ github.event.inputs.ai_pages_file }}")
+            fi
           fi
           if [ "${{ github.event.inputs.search_data }}" = "true" ]; then
             ARGS+=(--search-data)
@@ -75,6 +93,10 @@ jobs:
           fi
           if [ -n "${{ github.event.inputs.gsc_import_path }}" ]; then
             ARGS+=(--gsc-import "${{ github.event.inputs.gsc_import_path }}")
+          fi
+          if [ -n "${{ github.event.inputs.gsc_links_import_paths }}" ]; then
+            IFS=', ' read -ra LINKFILES <<< "${{ github.event.inputs.gsc_links_import_paths }}"
+            ARGS+=(--gsc-links-import "${LINKFILES[@]}")
           fi
           python seo_audit.py --output passot_seo_audit.xlsx "${ARGS[@]}"
 
