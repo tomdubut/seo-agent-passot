@@ -692,6 +692,23 @@ CATEGORY_GUIDANCE = {
     "Weakly Linked Internally": ("Add internal links to this page from related content elsewhere on the site.", "Quick"),
 }
 
+# Groups the fine-grained Issue.category strings above into the coarser
+# checkboxes exposed via --checks / the GitHub Actions form, so a user can
+# skip an entire family of checks (and its network cost/report tabs) rather
+# than always running the full technical audit.
+CHECK_GROUPS = {
+    "page_content": {
+        "Missing Title", "Duplicate Title", "Missing Meta Description",
+        "Duplicate Meta Description", "Missing Canonical", "Canonical Mismatch",
+        "Missing H1", "Multiple H1", "Missing Alt Text", "Thin Content",
+        "Missing Structured Data", "Missing Open Graph Tags",
+    },
+    "links": {"Broken Internal Link", "Weakly Linked Internally", "Sitemap Redirect"},
+    "en_jp": {"Missing Hreflang Cross-Link", "EN/JP Inconsistency", "No Language Counterpart"},
+}
+# A crawl failure isn't an optional "check" — always shown regardless of --checks.
+ALWAYS_INCLUDED_CATEGORIES = {"Page Unreachable"}
+
 
 # --------------------------------------------------------------------------
 # AI content & keyword analysis (opt-in via --ai-analysis)
@@ -791,17 +808,16 @@ def _selector_keys(value):
     return full_key, path_key
 
 
-def match_page_selectors(pages, entries):
-    """Matches raw --ai-pages/--ai-pages-file entries (full URLs or bare
-    paths) against crawled Page objects. Returns (matched_urls: set of
-    canonical p.url values, unmatched_entries: list of entries that matched
-    no page)."""
+def resolve_selectors(urls, entries):
+    """Matches raw selector entries (full URLs or bare paths) against a
+    plain list of URL strings. Returns (matched: set of urls from `urls`
+    that matched, unmatched_entries: list of entries that matched none)."""
     by_full = {}
     by_path = defaultdict(list)
-    for p in pages:
-        full_key, path_key = _selector_keys(p.url)
-        by_full[full_key] = p.url
-        by_path[path_key].append(p.url)
+    for u in urls:
+        full_key, path_key = _selector_keys(u)
+        by_full[full_key] = u
+        by_path[path_key].append(u)
 
     matched = set()
     unmatched = []
@@ -817,6 +833,14 @@ def match_page_selectors(pages, entries):
         else:
             unmatched.append(entry)
     return matched, unmatched
+
+
+def match_page_selectors(pages, entries):
+    """Matches raw --ai-pages/--ai-pages-file entries (full URLs or bare
+    paths) against crawled Page objects. Returns (matched_urls: set of
+    canonical p.url values, unmatched_entries: list of entries that matched
+    no page)."""
+    return resolve_selectors([p.url for p in pages], entries)
 
 
 def analyze_page_with_ai(client, page, model, target_keyword=None, keyword_source=None):
@@ -1301,7 +1325,8 @@ def write_issues_sheet(wb, issues):
 
 
 def write_executive_summary(wb, pages, issues, pairs, unmatched_en, unmatched_ja, recurring_alt,
-                             ai_results=None, orphan_search_pages=None):
+                             ai_results=None, orphan_search_pages=None,
+                             categories=("page_content", "links", "en_jp")):
     ws = wb.create_sheet("Executive Summary")
     ok_pages = [p for p in pages if p.ok]
     en_count = sum(1 for p in ok_pages if p.lang == "en")
@@ -1332,7 +1357,8 @@ def write_executive_summary(wb, pages, issues, pairs, unmatched_en, unmatched_ja
 
     header("Passot SEO Audit — Executive Summary")
     line(f"Pages audited: {len(ok_pages)}  ({en_count} EN, {ja_count} JP)")
-    line(f"EN/JP pairs matched: {len(pairs)}  |  Unmatched: {len(unmatched_en)} EN-only, {len(unmatched_ja)} JP-only")
+    if "en_jp" in categories:
+        line(f"EN/JP pairs matched: {len(pairs)}  |  Unmatched: {len(unmatched_en)} EN-only, {len(unmatched_ja)} JP-only")
     state["row"] += 1
 
     counts_by_sev = defaultdict(int)
@@ -1372,7 +1398,7 @@ def write_executive_summary(wb, pages, issues, pairs, unmatched_en, unmatched_ja
         state["row"] += 1
 
     content_gaps = unmatched_en + unmatched_ja
-    if content_gaps:
+    if "en_jp" in categories and content_gaps:
         subheader("Translation / content parity gaps (not in the Issues tab's severity ranking)")
         line(f"{len(unmatched_ja)} JP page(s) have no English version. {len(unmatched_en)} EN page(s) have no Japanese version.")
         line("Not necessarily wrong (e.g. intentionally JP-only blog posts) — but a deliberate content decision, not a bug to fix.")
@@ -1463,7 +1489,7 @@ def write_executive_summary(wb, pages, issues, pairs, unmatched_en, unmatched_ja
         )
     if med_cats:
         priorities.append("Schedule Medium severity issues next: " + ", ".join(med_cats) + ".")
-    if content_gaps:
+    if "en_jp" in categories and content_gaps:
         priorities.append(
             f"Decide on the {len(content_gaps)} page(s) with no counterpart in the other language — "
             "translate for parity, or confirm it's intentional (see the table above)."
@@ -1499,14 +1525,15 @@ def write_executive_summary(wb, pages, issues, pairs, unmatched_en, unmatched_ja
 
 def build_workbook(pages, issues, pairs, unmatched_en, unmatched_ja, broken_links, link_sources,
                     thin_words, thin_chars, en_prefix=DEFAULT_EN_PREFIX, ai_results=None,
-                    orphan_search_pages=None, gsc_linking_sites=None, gsc_linking_text=None):
+                    orphan_search_pages=None, gsc_linking_sites=None, gsc_linking_text=None,
+                    categories=("page_content", "links", "en_jp")):
     wb = Workbook()
     wb.remove(wb.active)
 
     write_issues_sheet(wb, issues)
     recurring_alt = find_recurring_missing_alt(pages)
     write_executive_summary(wb, pages, issues, pairs, unmatched_en, unmatched_ja, recurring_alt,
-                             ai_results, orphan_search_pages)
+                             ai_results, orphan_search_pages, categories=categories)
 
     # All Pages
     page_types = classify_page_types(pages, pairs, en_prefix, thin_words, thin_chars)
@@ -1530,125 +1557,131 @@ def build_workbook(pages, issues, pairs, unmatched_en, unmatched_ja, broken_link
         "Page Type", "Thin-Content Threshold Used",
     ], rows, col_widths=[45, 6, 8, 35, 10, 40, 10, 40, 8, 8, 8, 10, 10, 10, 10, 20, 14, 10, 16, 14])
 
-    # Meta Descriptions
-    dup_meta = find_duplicates(pages, lambda p: p.meta_description)
-    dup_meta_urls = {u for urls in dup_meta.values() for u in urls}
-    rows = []
-    for p in sorted(pages, key=lambda x: (x.lang, x.url)):
-        if not p.ok:
-            continue
-        rows.append([p.url, p.lang, p.meta_description, len(p.meta_description),
-                     "Yes" if not p.meta_description else "No",
-                     "Yes" if p.url in dup_meta_urls else "No"])
-    write_sheet(wb, "Meta Descriptions", ["URL", "Language", "Meta Description", "Length", "Missing?", "Duplicate?"],
-                rows, col_widths=[45, 6, 60, 8, 8, 10])
+    if "page_content" in categories:
+        # Meta Descriptions
+        dup_meta = find_duplicates(pages, lambda p: p.meta_description)
+        dup_meta_urls = {u for urls in dup_meta.values() for u in urls}
+        rows = []
+        for p in sorted(pages, key=lambda x: (x.lang, x.url)):
+            if not p.ok:
+                continue
+            rows.append([p.url, p.lang, p.meta_description, len(p.meta_description),
+                         "Yes" if not p.meta_description else "No",
+                         "Yes" if p.url in dup_meta_urls else "No"])
+        write_sheet(wb, "Meta Descriptions", ["URL", "Language", "Meta Description", "Length", "Missing?", "Duplicate?"],
+                    rows, col_widths=[45, 6, 60, 8, 8, 10])
 
-    # Titles & Headings
-    dup_titles = find_duplicates(pages, lambda p: p.title)
-    dup_title_urls = {u for urls in dup_titles.values() for u in urls}
-    rows = []
-    for p in sorted(pages, key=lambda x: (x.lang, x.url)):
-        if not p.ok:
-            continue
-        rows.append([p.url, p.lang, p.title, len(p.title),
-                     "Yes" if p.url in dup_title_urls else "No",
-                     len(p.h1_list), truncate_join(p.h1_list, 3),
-                     len(p.h2_list), truncate_join(p.h2_list, 5)])
-    write_sheet(wb, "Titles & Headings",
-                ["URL", "Language", "Title", "Title Length", "Duplicate Title?", "H1 Count", "H1 Text", "H2 Count", "H2 Text"],
-                rows, col_widths=[45, 6, 35, 10, 12, 8, 40, 8, 50])
+        # Titles & Headings
+        dup_titles = find_duplicates(pages, lambda p: p.title)
+        dup_title_urls = {u for urls in dup_titles.values() for u in urls}
+        rows = []
+        for p in sorted(pages, key=lambda x: (x.lang, x.url)):
+            if not p.ok:
+                continue
+            rows.append([p.url, p.lang, p.title, len(p.title),
+                         "Yes" if p.url in dup_title_urls else "No",
+                         len(p.h1_list), truncate_join(p.h1_list, 3),
+                         len(p.h2_list), truncate_join(p.h2_list, 5)])
+        write_sheet(wb, "Titles & Headings",
+                    ["URL", "Language", "Title", "Title Length", "Duplicate Title?", "H1 Count", "H1 Text", "H2 Count", "H2 Text"],
+                    rows, col_widths=[45, 6, 35, 10, 12, 8, 40, 8, 50])
 
-    # Images & Alt Text
-    rows = []
-    for p in sorted(pages, key=lambda x: (x.lang, x.url)):
-        if not p.ok:
-            continue
-        pct = round(100 * p.image_missing_alt / p.image_total, 1) if p.image_total else 0
-        rows.append([p.url, p.lang, p.image_total, p.image_missing_alt, pct,
-                     truncate_join(p.missing_alt_examples, 4)])
-    write_sheet(wb, "Images & Alt Text",
-                ["URL", "Language", "Total Images", "Missing Alt", "% Missing", "Example Sources"],
-                rows, col_widths=[45, 6, 10, 10, 10, 60])
+        # Images & Alt Text
+        rows = []
+        for p in sorted(pages, key=lambda x: (x.lang, x.url)):
+            if not p.ok:
+                continue
+            pct = round(100 * p.image_missing_alt / p.image_total, 1) if p.image_total else 0
+            rows.append([p.url, p.lang, p.image_total, p.image_missing_alt, pct,
+                         truncate_join(p.missing_alt_examples, 4)])
+        write_sheet(wb, "Images & Alt Text",
+                    ["URL", "Language", "Total Images", "Missing Alt", "% Missing", "Example Sources"],
+                    rows, col_widths=[45, 6, 10, 10, 10, 60])
 
-    # Internal Links (per page)
-    inbound_counts = compute_inbound_link_counts(pages)
-    rows = []
-    for p in sorted(pages, key=lambda x: (x.lang, x.url)):
-        if not p.ok:
-            continue
-        rows.append([p.url, p.lang, p.internal_link_count, len(inbound_counts.get(p.url, set()))])
-    write_sheet(wb, "Internal Links",
-                ["URL", "Language", "Outbound Links (main content)", "Inbound Links (from other pages' main content)"],
-                rows, col_widths=[45, 6, 22, 30])
+    if "links" in categories:
+        # Internal Links (per page)
+        inbound_counts = compute_inbound_link_counts(pages)
+        rows = []
+        for p in sorted(pages, key=lambda x: (x.lang, x.url)):
+            if not p.ok:
+                continue
+            rows.append([p.url, p.lang, p.internal_link_count, len(inbound_counts.get(p.url, set()))])
+        write_sheet(wb, "Internal Links",
+                    ["URL", "Language", "Outbound Links (main content)", "Inbound Links (from other pages' main content)"],
+                    rows, col_widths=[45, 6, 22, 30])
 
-    # Structured Data & Social Tags
-    rows = []
-    for p in sorted(pages, key=lambda x: (x.lang, x.url)):
-        if not p.ok:
-            continue
-        rows.append([
-            p.url, p.lang, truncate_join(p.structured_data_types, 5) or "(none)",
-            "Yes" if p.og_tags else "No",
-            "Yes" if "og:title" in p.og_tags else "No",
-            "Yes" if "og:description" in p.og_tags else "No",
-            "Yes" if "og:image" in p.og_tags else "No",
-            "Yes" if p.twitter_card else "No",
-        ])
-    write_sheet(wb, "Structured Data & Social", [
-        "URL", "Language", "JSON-LD Types Found", "Has Open Graph Tags?",
-        "OG Title?", "OG Description?", "OG Image?", "Twitter Card?",
-    ], rows, col_widths=[45, 6, 35, 16, 10, 14, 10, 12])
+    if "page_content" in categories:
+        # Structured Data & Social Tags
+        rows = []
+        for p in sorted(pages, key=lambda x: (x.lang, x.url)):
+            if not p.ok:
+                continue
+            rows.append([
+                p.url, p.lang, truncate_join(p.structured_data_types, 5) or "(none)",
+                "Yes" if p.og_tags else "No",
+                "Yes" if "og:title" in p.og_tags else "No",
+                "Yes" if "og:description" in p.og_tags else "No",
+                "Yes" if "og:image" in p.og_tags else "No",
+                "Yes" if p.twitter_card else "No",
+            ])
+        write_sheet(wb, "Structured Data & Social", [
+            "URL", "Language", "JSON-LD Types Found", "Has Open Graph Tags?",
+            "OG Title?", "OG Description?", "OG Image?", "Twitter Card?",
+        ], rows, col_widths=[45, 6, 35, 16, 10, 14, 10, 12])
 
-    # Broken Links
-    rows = []
-    for link, status in sorted(broken_links.items()):
-        is_broken = isinstance(status, str) or status >= 400
-        if is_broken:
-            rows.append([link, status, truncate_join(link_sources.get(link, set()), 6)])
-    write_sheet(wb, "Broken Links", ["Broken URL", "Status", "Linked From"], rows, col_widths=[50, 12, 80])
+    if "links" in categories:
+        # Broken Links
+        rows = []
+        for link, status in sorted(broken_links.items()):
+            is_broken = isinstance(status, str) or status >= 400
+            if is_broken:
+                rows.append([link, status, truncate_join(link_sources.get(link, set()), 6)])
+        write_sheet(wb, "Broken Links", ["Broken URL", "Status", "Linked From"], rows, col_widths=[50, 12, 80])
 
-    # Canonical Tags
-    rows = []
-    for p in sorted(pages, key=lambda x: (x.lang, x.url)):
-        if not p.ok:
-            continue
-        self_ref = p.canonical and (p.canonical.rstrip("/") == p.url.rstrip("/") or p.canonical.rstrip("/") == p.final_url.rstrip("/"))
-        rows.append([p.url, p.lang, p.canonical or "(missing)", "Yes" if self_ref else "No"])
-    write_sheet(wb, "Canonical Tags", ["URL", "Language", "Canonical Value", "Self-Referencing?"],
-                rows, col_widths=[45, 6, 45, 15])
+    if "page_content" in categories:
+        # Canonical Tags
+        rows = []
+        for p in sorted(pages, key=lambda x: (x.lang, x.url)):
+            if not p.ok:
+                continue
+            self_ref = p.canonical and (p.canonical.rstrip("/") == p.url.rstrip("/") or p.canonical.rstrip("/") == p.final_url.rstrip("/"))
+            rows.append([p.url, p.lang, p.canonical or "(missing)", "Yes" if self_ref else "No"])
+        write_sheet(wb, "Canonical Tags", ["URL", "Language", "Canonical Value", "Self-Referencing?"],
+                    rows, col_widths=[45, 6, 45, 15])
 
-    # EN-JP Comparison
-    rows = []
-    for en_page, ja_page in sorted(pairs, key=lambda pr: pr[0].url):
-        en_to_ja = en_page.hreflang.get("ja") or en_page.hreflang.get("ja-jp")
-        ja_to_en = ja_page.hreflang.get("en") or ja_page.hreflang.get("en-us") or ja_page.hreflang.get("en-gb")
-        reciprocal = bool(en_to_ja) and bool(ja_to_en) and \
-            en_to_ja.rstrip("/") == ja_page.url.rstrip("/") and ja_to_en.rstrip("/") == en_page.url.rstrip("/")
-        rows.append([
-            en_page.url, ja_page.url, "Yes" if reciprocal else "No",
-            en_page.title, ja_page.title,
-            "Yes" if en_page.meta_description else "No", "Yes" if ja_page.meta_description else "No",
-            "Yes" if (en_page.meta_description and ja_page.meta_description and
-                      en_page.meta_description.strip() == ja_page.meta_description.strip()) else "No",
-            len(en_page.h1_list), len(ja_page.h1_list),
-            en_page.canonical or "(missing)", ja_page.canonical or "(missing)",
-        ])
-    write_sheet(wb, "EN-JP Comparison", [
-        "EN URL", "JP URL", "Hreflang Reciprocal?", "EN Title", "JP Title",
-        "EN Meta Present?", "JP Meta Present?", "Meta Identical (Untranslated?)",
-        "EN H1 Count", "JP H1 Count", "EN Canonical", "JP Canonical",
-    ], rows, col_widths=[40, 40, 12, 30, 30, 10, 10, 16, 8, 8, 40, 40])
+    if "en_jp" in categories:
+        # EN-JP Comparison
+        rows = []
+        for en_page, ja_page in sorted(pairs, key=lambda pr: pr[0].url):
+            en_to_ja = en_page.hreflang.get("ja") or en_page.hreflang.get("ja-jp")
+            ja_to_en = ja_page.hreflang.get("en") or ja_page.hreflang.get("en-us") or ja_page.hreflang.get("en-gb")
+            reciprocal = bool(en_to_ja) and bool(ja_to_en) and \
+                en_to_ja.rstrip("/") == ja_page.url.rstrip("/") and ja_to_en.rstrip("/") == en_page.url.rstrip("/")
+            rows.append([
+                en_page.url, ja_page.url, "Yes" if reciprocal else "No",
+                en_page.title, ja_page.title,
+                "Yes" if en_page.meta_description else "No", "Yes" if ja_page.meta_description else "No",
+                "Yes" if (en_page.meta_description and ja_page.meta_description and
+                          en_page.meta_description.strip() == ja_page.meta_description.strip()) else "No",
+                len(en_page.h1_list), len(ja_page.h1_list),
+                en_page.canonical or "(missing)", ja_page.canonical or "(missing)",
+            ])
+        write_sheet(wb, "EN-JP Comparison", [
+            "EN URL", "JP URL", "Hreflang Reciprocal?", "EN Title", "JP Title",
+            "EN Meta Present?", "JP Meta Present?", "Meta Identical (Untranslated?)",
+            "EN H1 Count", "JP H1 Count", "EN Canonical", "JP Canonical",
+        ], rows, col_widths=[40, 40, 12, 30, 30, 10, 10, 16, 8, 8, 40, 40])
 
-    unmatched_rows = [[p.url, p.lang] for p in unmatched_en + unmatched_ja]
-    if unmatched_rows:
-        ws = wb["EN-JP Comparison"]
-        start = ws.max_row + 3
-        ws.cell(row=start, column=1, value="Pages with no counterpart:").font = Font(bold=True)
-        ws.cell(row=start + 1, column=1, value="URL").font = HEADER_FONT
-        ws.cell(row=start + 1, column=2, value="Language").font = HEADER_FONT
-        for i, (url, lang) in enumerate(unmatched_rows, start + 2):
-            ws.cell(row=i, column=1, value=url)
-            ws.cell(row=i, column=2, value=lang)
+        unmatched_rows = [[p.url, p.lang] for p in unmatched_en + unmatched_ja]
+        if unmatched_rows:
+            ws = wb["EN-JP Comparison"]
+            start = ws.max_row + 3
+            ws.cell(row=start, column=1, value="Pages with no counterpart:").font = Font(bold=True)
+            ws.cell(row=start + 1, column=1, value="URL").font = HEADER_FONT
+            ws.cell(row=start + 1, column=2, value="Language").font = HEADER_FONT
+            for i, (url, lang) in enumerate(unmatched_rows, start + 2):
+                ws.cell(row=i, column=1, value=url)
+                ws.cell(row=i, column=2, value=lang)
 
     if ai_results:
         write_ai_analysis_sheet(wb, pages, ai_results)
@@ -1781,6 +1814,23 @@ def parse_args(argv=None):
     ap.add_argument("--thin-chars", type=int, default=DEFAULT_THIN_CHARS_JA, help="Thin-content threshold for JP pages (characters)")
     ap.add_argument("--user-agent", default=DEFAULT_USER_AGENT)
     ap.add_argument("--max-pages", type=int, default=None, help="Limit number of pages crawled (for a quick test run)")
+    ap.add_argument("--pages", default=None,
+                     help="Scope the ENTIRE crawl (not just AI review) to these pages only — comma "
+                          "and/or newline separated full URLs or paths. Site-wide checks (duplicate "
+                          "titles/meta, EN/JP pairing, orphan/weak-link detection) become less "
+                          "accurate with a partial crawl. Union with --pages-file. Independent of "
+                          "--ai-pages/--ai-pages-file, which only narrow the paid AI review within "
+                          "whatever this already crawled.")
+    ap.add_argument("--pages-file", default=None,
+                     help="Text file, one URL/path per line ('#'-comments/blanks ignored), scoping "
+                          "the crawl like --pages. Union with --pages.")
+    ap.add_argument("--checks", nargs="+", default=["page_content", "links", "en_jp"],
+                     choices=["page_content", "links", "en_jp"],
+                     help="Which technical audit categories to run: page_content (titles, meta "
+                          "descriptions, headings, alt text, canonical tags, structured data), "
+                          "links (broken links, weak internal linking), en_jp (EN/JP hreflang and "
+                          "content parity). Default: all three. 'Page Unreachable' and the All "
+                          "Pages tab are always included regardless of this flag.")
     ap.add_argument("--skip-broken-links", action="store_true", help="Skip checking internal links for broken status")
     ap.add_argument("--exclude-sitemap", nargs="*", default=DEFAULT_SITEMAP_EXCLUDE,
                      help="Skip sub-sitemaps whose filename contains any of these substrings")
@@ -1952,6 +2002,26 @@ def main(argv=None):
         seen_urls.add(key)
         to_crawl.append((loc, lastmod))
 
+    if args.pages or args.pages_file:
+        try:
+            page_selector_entries = parse_page_selectors(args.pages, args.pages_file)
+        except Exception as e:
+            print(f"ERROR: could not read --pages-file: {e}", file=sys.stderr)
+            return 1
+        if page_selector_entries:
+            matched_urls, unmatched = resolve_selectors([loc for loc, _ in to_crawl], page_selector_entries)
+            if unmatched:
+                print(f"WARNING: {len(unmatched)} --pages/--pages-file entry(ies) matched no "
+                      f"page in the sitemap: {unmatched}", file=sys.stderr)
+            to_crawl = [(loc, lastmod) for loc, lastmod in to_crawl if loc in matched_urls]
+            if not to_crawl:
+                print("ERROR: --pages/--pages-file matched no pages in the sitemap.", file=sys.stderr)
+                return 1
+            print(f"Crawl scoped to {len(to_crawl)} page(s) via --pages/--pages-file — "
+                  "site-wide checks (duplicate titles/meta descriptions, EN/JP pairing, "
+                  "orphan/weak-internal-link detection) will be less accurate with a partial "
+                  "crawl. This is expected for a scoped run.", file=sys.stderr)
+
     if args.max_pages:
         to_crawl = to_crawl[:args.max_pages]
 
@@ -2033,15 +2103,22 @@ def main(argv=None):
                 print(f"  {len(unmatched_links)} linked-page URL(s) from the export didn't match "
                       f"a crawled page.", file=sys.stderr)
 
-    if args.skip_broken_links:
-        print("Skipping broken-link check (--skip-broken-links).")
+    skip_broken = args.skip_broken_links or "links" not in args.checks
+    if skip_broken:
+        reason = "--skip-broken-links" if args.skip_broken_links else "--checks doesn't include 'links'"
+        print(f"Skipping broken-link check ({reason}).")
     else:
         print("Checking internal links for broken status (this can take a while) ...")
-    broken_links, link_sources = check_broken_links(session, pages, args.timeout, args.delay, skip=args.skip_broken_links)
+    broken_links, link_sources = check_broken_links(session, pages, args.timeout, args.delay, skip=skip_broken)
 
     print("Generating issue list ...")
     issues = generate_issues(pages, pairs, unmatched_en, unmatched_ja, broken_links, link_sources,
                               dup_titles, dup_meta, args.thin_words, args.thin_chars, args.en_prefix)
+
+    allowed_categories = set(ALWAYS_INCLUDED_CATEGORIES)
+    for group in args.checks:
+        allowed_categories |= CHECK_GROUPS[group]
+    issues = [i for i in issues if i.category in allowed_categories]
 
     ai_results = None
     if args.ai_analysis:
@@ -2071,7 +2148,7 @@ def main(argv=None):
     print("Writing workbook ...")
     wb = build_workbook(pages, issues, pairs, unmatched_en, unmatched_ja, broken_links, link_sources,
                          args.thin_words, args.thin_chars, args.en_prefix, ai_results, orphan_search_pages,
-                         gsc_linking_sites, gsc_linking_text)
+                         gsc_linking_sites, gsc_linking_text, categories=args.checks)
     wb.save(args.output)
 
     counts = defaultdict(int)

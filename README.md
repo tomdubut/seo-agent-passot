@@ -37,6 +37,9 @@ Useful flags (see `python seo_audit.py --help` for the full list):
 |---|---|
 | `--sitemap-url URL` | Point at a different sitemap (e.g. if it's `/sitemap.xml` instead of `/sitemap_index.xml` — check WP admin / your SEO plugin to confirm) |
 | `--max-pages N` | Crawl only the first N pages — good for a quick smoke test before a full run |
+| `--checks page_content links en_jp` | Which technical audit categories to run (default: all three) — see below |
+| `--pages TEXT` | Scope the ENTIRE run to these specific pages only — comma/newline-separated URLs or paths — see below |
+| `--pages-file FILE` | Same as `--pages`, but from a text file (one URL/path per line) — see below |
 | `--skip-broken-links` | Skip internal link status checks (faster, but you lose that check) |
 | `--output FILE.xlsx` | Change the output filename |
 | `--thin-words N` / `--thin-chars N` | Fallback thin-content thresholds for pages that don't match a known page type below (default: 300 words for EN, 600 characters for JP) |
@@ -59,6 +62,48 @@ If the site blocks the crawler (403s), it's likely a WAF/bot-protection
 rule reacting to the request pattern or User-Agent — try `--delay 2` first,
 or check whether your host's security plugin is challenging automated
 requests from your IP.
+
+## Running only part of the audit (`--checks`, `--pages`)
+
+Everything runs by default. Two independent ways to run less:
+
+**Pick which categories run (`--checks`):** the technical audit is split
+into three groups — `page_content` (titles, meta descriptions, headings,
+alt text, canonical tags, structured data), `links` (broken links, weak
+internal linking), and `en_jp` (English/Japanese hreflang and content
+parity). Run just one or two:
+```bash
+python seo_audit.py --checks links
+```
+Skipping `links` also skips the actual broken-link network checking, not
+just its report tab — so excluding a category saves real time, not just
+report clutter. Whatever you exclude disappears from the Issues Summary,
+its own report tab, and any related Executive Summary sections (e.g.
+skip `en_jp` and the EN/JP pairing stats and parity-gap table don't show
+up either). "Page Unreachable" and the All Pages overview tab always show
+regardless — a crawl failure isn't an optional check.
+
+Via GitHub Actions, this is the three checkboxes at the top of the "Run
+workflow" form.
+
+**Pick which pages get audited at all (`--pages` / `--pages-file`):**
+unlike `--max-pages` (which just takes the first N pages in sitemap
+order), this lets you name the exact pages you want:
+```bash
+python seo_audit.py --pages "https://www.passot.co.jp/en/about/, /products/2byo/"
+```
+or, for a longer list, `--pages-file pages.txt` (one URL or path per
+line). This scopes the **entire** run, not just AI review (that's what
+`--ai-pages`/`--ai-pages-file` are for, see below) — useful for a quick
+"just check what I edited" pass. The tradeoff: checks that compare across
+the whole site (duplicate titles/descriptions, EN/JP pairing, orphan and
+weakly-linked-page detection) get less accurate when only part of the
+site is crawled — the tool prints a warning when this happens, since it's
+expected for a scoped run, not a bug.
+
+Via GitHub Actions, use the `pages` field for a short comma-separated
+list, or upload a text file and point `pages_file` at its path (same
+upload flow as `gsc-exports/` below).
 
 ## About the thin-content thresholds
 
@@ -293,6 +338,9 @@ rather than silently misreading the file; if that happens, share the
 error and it can be adjusted.
 
 ## What it checks
+
+All three groups below run by default; `--checks` (see above) lets you
+run only some of them.
 
 - **Per page:** title tag, meta description, canonical tag, H1/H2
   structure, image alt-text coverage, internal link count in and out
