@@ -3,6 +3,29 @@ name: SEO Audit
 on:
   workflow_dispatch:
     inputs:
+      checks_page_content:
+        description: "Check page basics: titles, meta descriptions, headings, image alt text, canonical tags, and structured data"
+        required: false
+        default: true
+        type: boolean
+      checks_links:
+        description: "Check links: broken links and pages that don't have enough other pages linking to them"
+        required: false
+        default: true
+        type: boolean
+      checks_en_jp:
+        description: "Check English/Japanese pairing: matching language tags and consistency between the English and Japanese versions of each page"
+        required: false
+        default: true
+        type: boolean
+      pages:
+        description: "Only check these specific pages instead of the whole site, comma-separated URLs or paths (leave blank to check everything)"
+        required: false
+        default: ""
+      pages_file:
+        description: "Path in this repo to a text file (one page per line) listing specific pages to check — upload via GitHub's web UI first (leave blank to check everything)"
+        required: false
+        default: ""
       max_pages:
         description: "Limit number of pages crawled (leave blank for a full run)"
         required: false
@@ -67,6 +90,23 @@ jobs:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
         run: |
           ARGS=()
+          CHECKS=()
+          if [ "${{ github.event.inputs.checks_page_content }}" = "true" ]; then CHECKS+=(page_content); fi
+          if [ "${{ github.event.inputs.checks_links }}" = "true" ]; then CHECKS+=(links); fi
+          if [ "${{ github.event.inputs.checks_en_jp }}" = "true" ]; then CHECKS+=(en_jp); fi
+          if [ ${#CHECKS[@]} -eq 0 ]; then
+            echo "ERROR: at least one of the three 'Check ...' checkboxes must be checked." >&2
+            exit 1
+          fi
+          if [ ${#CHECKS[@]} -lt 3 ]; then
+            ARGS+=(--checks "${CHECKS[@]}")
+          fi
+          if [ -n "${{ github.event.inputs.pages }}" ]; then
+            ARGS+=(--pages "${{ github.event.inputs.pages }}")
+          fi
+          if [ -n "${{ github.event.inputs.pages_file }}" ]; then
+            ARGS+=(--pages-file "${{ github.event.inputs.pages_file }}")
+          fi
           if [ -n "${{ github.event.inputs.max_pages }}" ]; then
             ARGS+=(--max-pages "${{ github.event.inputs.max_pages }}")
           fi
